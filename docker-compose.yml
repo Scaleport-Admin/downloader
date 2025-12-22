@@ -1,0 +1,67 @@
+version: '3.8'
+
+services:
+  file-downloader:
+    build: .
+    container_name: file-downloader
+    image: file-downloader:latest
+    ports:
+      - "8000:8000"
+    volumes:
+      # Download destination - adjust to your TrueNAS pool path
+      - /mnt/pool/downloads:/downloads
+      # Persistent data (SQLite database)
+      - /mnt/pool/file-downloader/data:/data
+    environment:
+      # Timezone
+      - TZ=Europe/Prague
+
+      # Required - API key for authentication
+      - API_KEY=${API_KEY}
+
+      # Server settings
+      - PORT=8000
+      - LOG_LEVEL=INFO
+
+      # Rate limiting
+      - RATE_LIMIT_REQUESTS=10
+      - RATE_LIMIT_WINDOW_SECONDS=60
+
+      # Download settings
+      - MAX_CONCURRENT_DOWNLOADS=1
+      - MAX_BANDWIDTH_MBPS=100
+      - AUTO_DECOMPRESS=true
+
+      # Retry settings
+      - MAX_RETRY_ATTEMPTS=3
+      - RETRY_BACKOFF_BASE_SECONDS=5
+
+      # Webhook settings
+      - WEBHOOK_RETRY_ATTEMPTS=3
+      - WEBHOOK_RETRY_BACKOFF_SECONDS=5
+
+      # Database settings
+      - DATABASE_PATH=/data/downloads.db
+      - HISTORY_RETENTION_DAYS=30
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    # Resource limits (optional, adjust as needed)
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
