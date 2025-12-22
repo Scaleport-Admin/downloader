@@ -32,6 +32,7 @@ MAX_BANDWIDTH_MBPS = float(os.getenv("MAX_BANDWIDTH_MBPS", "0"))  # 0 = unlimite
 AUTO_DECOMPRESS = os.getenv("AUTO_DECOMPRESS", "true").lower() == "true"
 MAX_RETRY_ATTEMPTS = int(os.getenv("MAX_RETRY_ATTEMPTS", "3"))
 RETRY_BACKOFF_BASE_SECONDS = int(os.getenv("RETRY_BACKOFF_BASE_SECONDS", "5"))
+DOWNLOADS_BASE_PATH = os.getenv("DOWNLOADS_BASE_PATH", "/downloads")
 
 # Chunk size for streaming (8KB)
 CHUNK_SIZE = 8192
@@ -48,6 +49,38 @@ def get_semaphore() -> asyncio.Semaphore:
     if _download_semaphore is None:
         _download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
     return _download_semaphore
+
+
+def normalize_download_path(path: str) -> str:
+    """
+    Normalize download path to be within DOWNLOADS_BASE_PATH.
+
+    If path doesn't start with DOWNLOADS_BASE_PATH, it will be treated
+    as a relative path and prepended with DOWNLOADS_BASE_PATH.
+
+    Args:
+        path: Requested download path
+
+    Returns:
+        Normalized absolute path within DOWNLOADS_BASE_PATH
+    """
+    # Remove leading slash for relative path handling
+    clean_path = path.lstrip("/")
+
+    # Check if path already starts with downloads base (without leading slash)
+    base_without_slash = DOWNLOADS_BASE_PATH.lstrip("/")
+    if clean_path.startswith(base_without_slash + "/") or clean_path == base_without_slash:
+        # Path already includes base, just ensure it starts with /
+        return "/" + clean_path
+
+    # Check if path already starts with full base path
+    if path.startswith(DOWNLOADS_BASE_PATH + "/") or path == DOWNLOADS_BASE_PATH:
+        return path
+
+    # Treat as relative path, prepend base
+    normalized = os.path.join(DOWNLOADS_BASE_PATH, clean_path)
+    logger.info(f"Path normalized: '{path}' -> '{normalized}'")
+    return normalized
 
 
 def get_active_downloads() -> dict[str, dict]:
@@ -114,12 +147,15 @@ async def start_download(
     # Sanitize filename
     safe_filename = sanitize_filename(filename)
 
+    # Normalize path to be within downloads directory
+    normalized_path = normalize_download_path(path)
+
     # Initialize active download state
     _active_downloads[download_id] = {
         "download_id": download_id,
         "url": url,
         "filename": safe_filename,
-        "path": path,
+        "path": normalized_path,
         "status": "downloading",
         "progress_percent": 0.0,
         "downloaded_bytes": 0,
@@ -141,7 +177,7 @@ async def start_download(
         download_id=download_id,
         url=url,
         filename=safe_filename,
-        path=path,
+        path=normalized_path,
         cookie=cookie,
         headers=json.dumps(headers) if headers else None,
         method=method,
@@ -154,7 +190,7 @@ async def start_download(
     task = asyncio.create_task(_download_worker(download_id))
     _download_tasks[download_id] = task
 
-    logger.info(f"[{download_id}] Download started: {url} -> {path}/{safe_filename}")
+    logger.info(f"[{download_id}] Download started: {url} -> {normalized_path}/{safe_filename}")
     return download_id
 
 
