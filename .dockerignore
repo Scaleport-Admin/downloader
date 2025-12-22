@@ -53,9 +53,11 @@ docs/
 !README.md
 
 # Docker
-Dockerfile*
 docker-compose*.yml
 .docker/
+
+# Keep entrypoint
+!entrypoint.sh
 
 # Misc
 .DS_Store

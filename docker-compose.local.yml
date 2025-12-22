@@ -1,0 +1,39 @@
+# File Downloader Service - Local Development/Testing Configuration
+#
+# Usage:
+#   docker-compose -f docker-compose.local.yml up --build
+
+version: '3.8'
+
+services:
+  file-downloader:
+    build: .
+    container_name: file-downloader
+    image: file-downloader:latest
+    ports:
+      - "8000:8000"
+    volumes:
+      # Use named volumes for local testing (no permission issues)
+      - downloader-data:/data
+      - downloader-downloads:/downloads
+    environment:
+      - TZ=Europe/Prague
+      - PUID=1000
+      - PGID=1000
+      - API_KEY=test_api_key_12345
+      - PORT=8000
+      - LOG_LEVEL=DEBUG
+      - MAX_CONCURRENT_DOWNLOADS=2
+      - MAX_BANDWIDTH_MBPS=0
+      - AUTO_DECOMPRESS=true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  downloader-data:
+  downloader-downloads:

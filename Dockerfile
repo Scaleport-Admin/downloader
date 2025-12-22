@@ -27,18 +27,19 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:$PATH" \
     TZ=Europe/Prague
 
-# Install runtime dependencies
+# Install runtime dependencies including gosu for privilege dropping
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     tzdata \
+    gosu \
     && rm -rf /var/lib/apt/lists/* \
     && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
     && echo $TZ > /etc/timezone
 
-# Create non-root user for security
-RUN groupadd -r appgroup && useradd -r -g appgroup appuser
+# Create non-root user for security (with fixed UID/GID for volume permissions)
+RUN groupadd -r -g 1000 appgroup && useradd -r -g appgroup -u 1000 appuser
 
-# Create directories
+# Create directories with proper ownership
 RUN mkdir -p /app /data /downloads \
     && chown -R appuser:appgroup /app /data /downloads
 
@@ -51,8 +52,8 @@ WORKDIR /app
 # Copy application code
 COPY --chown=appuser:appgroup app/ ./app/
 
-# Switch to non-root user
-USER appuser
+# Copy entrypoint script
+COPY --chmod=755 entrypoint.sh /entrypoint.sh
 
 # Expose port
 EXPOSE 8000
@@ -67,7 +68,12 @@ ENV PORT=8000 \
     DATABASE_PATH=/data/downloads.db \
     MAX_CONCURRENT_DOWNLOADS=1 \
     AUTO_DECOMPRESS=true \
-    HISTORY_RETENTION_DAYS=30
+    HISTORY_RETENTION_DAYS=30 \
+    PUID=1000 \
+    PGID=1000
+
+# Use entrypoint for permission handling
+ENTRYPOINT ["/entrypoint.sh"]
 
 # Run the application
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

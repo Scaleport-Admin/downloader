@@ -1,3 +1,13 @@
+# File Downloader Service - Docker Compose Configuration
+#
+# IMPORTANT: Before running, create host directories with proper permissions:
+#   sudo mkdir -p /mnt/pool/downloads /mnt/pool/file-downloader/data
+#   sudo chown -R 1000:1000 /mnt/pool/downloads /mnt/pool/file-downloader/data
+#
+# Or set PUID/PGID to match your user's UID/GID:
+#   id -u  # Get your UID
+#   id -g  # Get your GID
+
 version: '3.8'
 
 services:
@@ -15,6 +25,10 @@ services:
     environment:
       # Timezone
       - TZ=Europe/Prague
+
+      # User/Group IDs for volume permissions (match your host user)
+      - PUID=1000
+      - PGID=1000
 
       # Required - API key for authentication
       - API_KEY=${API_KEY}

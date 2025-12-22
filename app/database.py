@@ -33,12 +33,35 @@ class Database:
     async def connect(self) -> None:
         """Establish database connection and create tables."""
         # Ensure directory exists
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir:
+            try:
+                os.makedirs(db_dir, exist_ok=True)
+                logger.info(f"Database directory ensured: {db_dir}")
+            except PermissionError as e:
+                logger.error(f"Cannot create database directory {db_dir}: {e}")
+                logger.error("Make sure the /data volume is mounted with correct permissions")
+                raise
 
-        self._connection = await aiosqlite.connect(self.db_path)
-        self._connection.row_factory = aiosqlite.Row
-        await self._create_tables()
-        logger.info(f"Database connected: {self.db_path}")
+        # Test if we can write to the directory
+        try:
+            test_file = os.path.join(db_dir if db_dir else ".", ".write_test")
+            with open(test_file, "w") as f:
+                f.write("test")
+            os.remove(test_file)
+        except (PermissionError, OSError) as e:
+            logger.error(f"Cannot write to database directory {db_dir}: {e}")
+            logger.error("Make sure the /data volume is mounted with correct permissions")
+            raise
+
+        try:
+            self._connection = await aiosqlite.connect(self.db_path)
+            self._connection.row_factory = aiosqlite.Row
+            await self._create_tables()
+            logger.info(f"Database connected: {self.db_path}")
+        except Exception as e:
+            logger.error(f"Failed to connect to database: {e}")
+            raise
 
     async def disconnect(self) -> None:
         """Close database connection."""
