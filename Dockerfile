@@ -57,8 +57,9 @@ RUN printf '#!/bin/sh\n\
 set -e\n\
 PUID=${PUID:-1000}\n\
 PGID=${PGID:-1000}\n\
+PORT=${PORT:-8000}\n\
 echo "Starting File Downloader Service..."\n\
-echo "UID: $PUID, GID: $PGID"\n\
+echo "UID: $PUID, GID: $PGID, PORT: $PORT"\n\
 if [ "$PUID" != "1000" ] || [ "$PGID" != "1000" ]; then\n\
     groupmod -g "$PGID" appgroup 2>/dev/null || true\n\
     usermod -u "$PUID" -g "$PGID" appuser 2>/dev/null || true\n\
@@ -73,16 +74,9 @@ if ! gosu appuser touch /downloads/.write_test 2>/dev/null; then\n\
     chmod 777 /downloads 2>/dev/null || true\n\
 fi\n\
 rm -f /downloads/.write_test 2>/dev/null || true\n\
-echo "Starting application..."\n\
-exec gosu appuser "$@"\n\
+echo "Starting application on port $PORT..."\n\
+exec gosu appuser uvicorn app.main:app --host 0.0.0.0 --port $PORT\n\
 ' > /entrypoint.sh && chmod +x /entrypoint.sh
-
-# Expose port
-EXPOSE 8000
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
 
 # Default environment variables
 ENV PORT=8000 \
@@ -96,6 +90,3 @@ ENV PORT=8000 \
 
 # Use entrypoint for permission handling
 ENTRYPOINT ["/entrypoint.sh"]
-
-# Run the application
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
