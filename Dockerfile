@@ -52,8 +52,9 @@ WORKDIR /app
 # Copy application code
 COPY --chown=appuser:appgroup app/ ./app/
 
-# Copy entrypoint script
-COPY --chmod=755 entrypoint.sh /entrypoint.sh
+# Copy entrypoint script and ensure it's executable
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
 # Expose port
 EXPOSE 8000

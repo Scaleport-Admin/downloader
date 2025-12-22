@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 set -e
 
 # Get user/group IDs from environment (default to 1000)
@@ -31,22 +31,18 @@ fi
 echo "Setting directory ownership..."
 chown -R appuser:appgroup /data /downloads /app 2>/dev/null || true
 
-# Verify write access
+# Verify write access by testing as appuser
 echo "Verifying write permissions..."
 
-if ! su-exec appuser touch /data/.write_test 2>/dev/null; then
-    if ! gosu appuser touch /data/.write_test 2>/dev/null; then
-        echo "WARNING: appuser cannot write to /data, attempting chmod..."
-        chmod 777 /data 2>/dev/null || true
-    fi
+if ! gosu appuser touch /data/.write_test 2>/dev/null; then
+    echo "WARNING: appuser cannot write to /data, attempting chmod..."
+    chmod 777 /data 2>/dev/null || true
 fi
 rm -f /data/.write_test 2>/dev/null || true
 
-if ! su-exec appuser touch /downloads/.write_test 2>/dev/null; then
-    if ! gosu appuser touch /downloads/.write_test 2>/dev/null; then
-        echo "WARNING: appuser cannot write to /downloads, attempting chmod..."
-        chmod 777 /downloads 2>/dev/null || true
-    fi
+if ! gosu appuser touch /downloads/.write_test 2>/dev/null; then
+    echo "WARNING: appuser cannot write to /downloads, attempting chmod..."
+    chmod 777 /downloads 2>/dev/null || true
 fi
 rm -f /downloads/.write_test 2>/dev/null || true
 
