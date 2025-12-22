@@ -52,9 +52,30 @@ WORKDIR /app
 # Copy application code
 COPY --chown=appuser:appgroup app/ ./app/
 
-# Copy entrypoint script and ensure it's executable
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+# Create entrypoint script inline (avoids file transfer issues)
+RUN printf '#!/bin/sh\n\
+set -e\n\
+PUID=${PUID:-1000}\n\
+PGID=${PGID:-1000}\n\
+echo "Starting File Downloader Service..."\n\
+echo "UID: $PUID, GID: $PGID"\n\
+if [ "$PUID" != "1000" ] || [ "$PGID" != "1000" ]; then\n\
+    groupmod -g "$PGID" appgroup 2>/dev/null || true\n\
+    usermod -u "$PUID" -g "$PGID" appuser 2>/dev/null || true\n\
+fi\n\
+mkdir -p /data /downloads\n\
+chown -R appuser:appgroup /data /downloads /app 2>/dev/null || true\n\
+if ! gosu appuser touch /data/.write_test 2>/dev/null; then\n\
+    chmod 777 /data 2>/dev/null || true\n\
+fi\n\
+rm -f /data/.write_test 2>/dev/null || true\n\
+if ! gosu appuser touch /downloads/.write_test 2>/dev/null; then\n\
+    chmod 777 /downloads 2>/dev/null || true\n\
+fi\n\
+rm -f /downloads/.write_test 2>/dev/null || true\n\
+echo "Starting application..."\n\
+exec gosu appuser "$@"\n\
+' > /entrypoint.sh && chmod +x /entrypoint.sh
 
 # Expose port
 EXPOSE 8000
