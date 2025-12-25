@@ -343,8 +343,11 @@ async def _stream_download(
     if start_byte > 0:
         headers["Range"] = f"bytes={start_byte}-"
 
-    # Calculate bandwidth limit
+    # Calculate bandwidth limit (bytes per second)
     bytes_per_second = (MAX_BANDWIDTH_MBPS * 1024 * 1024 / 8) if MAX_BANDWIDTH_MBPS > 0 else 0
+
+    # For bandwidth limiting - track chunk timing
+    chunk_start_time = time.time()
 
     # Progress tracking
     downloaded_bytes = start_byte
@@ -397,15 +400,17 @@ async def _stream_download(
                     f.write(chunk)
                     downloaded_bytes += len(chunk)
 
-                    # Apply bandwidth limiting
+                    # Apply bandwidth limiting using token bucket approach
                     if bytes_per_second > 0:
-                        elapsed = time.time() - last_update_time
-                        if elapsed > 0:
-                            current_rate = (downloaded_bytes - last_update_bytes) / elapsed
-                            if current_rate > bytes_per_second:
-                                sleep_time = (len(chunk) / bytes_per_second) - (len(chunk) / current_rate)
-                                if sleep_time > 0:
-                                    await asyncio.sleep(sleep_time)
+                        # Calculate how long this chunk should take at target rate
+                        expected_time = len(chunk) / bytes_per_second
+                        # Calculate actual elapsed time for this chunk
+                        actual_time = time.time() - chunk_start_time
+                        # Sleep if we're going too fast
+                        if actual_time < expected_time:
+                            await asyncio.sleep(expected_time - actual_time)
+                        # Reset chunk timer for next iteration
+                        chunk_start_time = time.time()
 
                     # Update progress
                     current_time = time.time()
