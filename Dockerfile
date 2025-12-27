@@ -58,13 +58,19 @@ set -e\n\
 PUID=${PUID:-1000}\n\
 PGID=${PGID:-1000}\n\
 PORT=${PORT:-8000}\n\
+RUN_AS_ROOT=${RUN_AS_ROOT:-false}\n\
 echo "Starting File Downloader Service..."\n\
-echo "UID: $PUID, GID: $PGID, PORT: $PORT"\n\
+echo "UID: $PUID, GID: $PGID, PORT: $PORT, RUN_AS_ROOT: $RUN_AS_ROOT"\n\
+mkdir -p /data /downloads\n\
+if [ "$RUN_AS_ROOT" = "true" ] || [ "$RUN_AS_ROOT" = "1" ]; then\n\
+    echo "Running as root (for NFS/network shares)..."\n\
+    chown -R root:root /data 2>/dev/null || true\n\
+    exec uvicorn app.main:app --host 0.0.0.0 --port $PORT\n\
+fi\n\
 if [ "$PUID" != "1000" ] || [ "$PGID" != "1000" ]; then\n\
     groupmod -g "$PGID" appgroup 2>/dev/null || true\n\
     usermod -u "$PUID" -g "$PGID" appuser 2>/dev/null || true\n\
 fi\n\
-mkdir -p /data /downloads\n\
 chown -R appuser:appgroup /data /downloads /app 2>/dev/null || true\n\
 if ! gosu appuser touch /data/.write_test 2>/dev/null; then\n\
     chmod 777 /data 2>/dev/null || true\n\
@@ -86,7 +92,8 @@ ENV PORT=8000 \
     AUTO_DECOMPRESS=true \
     HISTORY_RETENTION_DAYS=30 \
     PUID=1000 \
-    PGID=1000
+    PGID=1000 \
+    RUN_AS_ROOT=false
 
 # Use entrypoint for permission handling
 ENTRYPOINT ["/entrypoint.sh"]
