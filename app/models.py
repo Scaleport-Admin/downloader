@@ -8,8 +8,8 @@ from pydantic import BaseModel, Field, field_validator
 import re
 
 
-class DownloadRequest(BaseModel):
-    """Request model for starting a new download."""
+class DownloadRequestBase(BaseModel):
+    """Download parameters shared by the public API and the web UI."""
 
     url: str = Field(..., description="URL of the file to download")
     filename: str = Field(..., description="Name for the downloaded file")
@@ -20,7 +20,6 @@ class DownloadRequest(BaseModel):
     post_data: Optional[dict] = Field(None, description="POST request body data")
     webhook_url_complete: Optional[str] = Field(None, description="Webhook URL for completion")
     webhook_url_error: Optional[str] = Field(None, description="Webhook URL for errors")
-    api_key: str = Field(..., description="API key for authentication")
 
     @field_validator("method")
     @classmethod
@@ -42,6 +41,12 @@ class DownloadRequest(BaseModel):
         if not v.startswith("/"):
             raise ValueError("Path must be absolute (start with /)")
         return v
+
+
+class DownloadRequest(DownloadRequestBase):
+    """Request model for starting a new download."""
+
+    api_key: str = Field(..., description="API key for authentication")
 
 
 class DownloadResponse(BaseModel):

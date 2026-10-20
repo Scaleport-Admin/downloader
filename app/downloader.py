@@ -15,6 +15,8 @@ import httpx
 
 from app.database import db
 from app.metrics import metrics
+from app.settings import settings
+from app.throttle import BandwidthThrottle, DownloadSlots, mbps_to_bytes_per_second
 from app.utils import (
     calculate_eta,
     decompress_file,
@@ -27,28 +29,39 @@ from app.webhooks import send_completion_webhook, send_error_webhook
 logger = logging.getLogger("file-downloader")
 
 # Configuration from environment
-MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "1"))
-MAX_BANDWIDTH_MBPS = float(os.getenv("MAX_BANDWIDTH_MBPS", "0"))  # 0 = unlimited
-AUTO_DECOMPRESS = os.getenv("AUTO_DECOMPRESS", "true").lower() == "true"
-MAX_RETRY_ATTEMPTS = int(os.getenv("MAX_RETRY_ATTEMPTS", "3"))
-RETRY_BACKOFF_BASE_SECONDS = int(os.getenv("RETRY_BACKOFF_BASE_SECONDS", "5"))
+# Download behaviour (concurrency, bandwidth, retries, decompression) is read
+# from app.settings at runtime so it can be changed without a restart.
 DOWNLOADS_BASE_PATH = os.getenv("DOWNLOADS_BASE_PATH", "/downloads")
 
-# Chunk size for streaming (8KB)
-CHUNK_SIZE = 8192
+# Chunk size for streaming (64KB)
+CHUNK_SIZE = 65536
+
+# How often paused downloads check whether they may continue
+PAUSE_POLL_INTERVAL = 0.5
 
 # Global state for active downloads
 _active_downloads: dict[str, dict] = {}
 _download_tasks: dict[str, asyncio.Task] = {}
-_download_semaphore: Optional[asyncio.Semaphore] = None
+_download_slots: Optional[DownloadSlots] = None
+_total_throttle = BandwidthThrottle()
+_globally_paused = False
 
 
-def get_semaphore() -> asyncio.Semaphore:
-    """Get or create the download semaphore."""
-    global _download_semaphore
-    if _download_semaphore is None:
-        _download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
-    return _download_semaphore
+class DownloadPaused(Exception):
+    """Raised inside the streaming loop when a download is paused."""
+
+
+def get_slots() -> DownloadSlots:
+    """Get or create the download concurrency limiter."""
+    global _download_slots
+    if _download_slots is None:
+        _download_slots = DownloadSlots(settings.get("max_concurrent_downloads"))
+    return _download_slots
+
+
+def apply_settings() -> None:
+    """Apply changed runtime settings to running components."""
+    get_slots().limit = max(1, settings.get("max_concurrent_downloads"))
 
 
 def normalize_download_path(path: str) -> str:
@@ -96,6 +109,199 @@ def is_download_cancelled(download_id: str) -> bool:
     return True  # If not in active downloads, consider it cancelled
 
 
+def _is_runnable(download_id: str) -> bool:
+    """Check if a download is allowed to transfer data (not paused)."""
+    download = _active_downloads.get(download_id)
+    if not download:
+        return False
+    return not download.get("paused", False) and not _globally_paused
+
+
+def _set_state(download_id: str, state: str, **fields) -> None:
+    """Update the detailed state of an active download (used by the web UI)."""
+    download = _active_downloads.get(download_id)
+    if download:
+        download["state"] = state
+        if state != "downloading":
+            download["speed_mbps"] = None
+            download["eta_seconds"] = None
+        download.update(fields)
+
+
+def is_globally_paused() -> bool:
+    """Check if all downloads are paused."""
+    return _globally_paused
+
+
+def pause_all() -> None:
+    """Pause all downloads; queued and new downloads will not start until resumed."""
+    global _globally_paused
+    _globally_paused = True
+    logger.info("All downloads paused")
+
+
+def resume_all() -> None:
+    """Resume all downloads (individually paused downloads stay paused)."""
+    global _globally_paused
+    _globally_paused = False
+    logger.info("All downloads resumed")
+
+
+def pause_download(download_id: str) -> bool:
+    """
+    Pause a download. The partial file is kept and the download continues
+    from the same position when resumed.
+
+    Returns:
+        True if download was found
+    """
+    download = _active_downloads.get(download_id)
+    if not download or download.get("cancelled"):
+        return False
+    download["paused"] = True
+    logger.info(f"[{download_id}] Download paused")
+    return True
+
+
+def resume_download(download_id: str) -> bool:
+    """
+    Resume a paused download.
+
+    Returns:
+        True if download was found
+    """
+    download = _active_downloads.get(download_id)
+    if not download or download.get("cancelled"):
+        return False
+    download["paused"] = False
+    logger.info(f"[{download_id}] Download resumed")
+    return True
+
+
+def set_download_limit(download_id: str, limit_mbps: Optional[float]) -> bool:
+    """
+    Set a speed limit for a single download (None or 0 = only global limits apply).
+
+    Returns:
+        True if download was found
+    """
+    download = _active_downloads.get(download_id)
+    if not download:
+        return False
+    download["limit_mbps"] = limit_mbps if limit_mbps and limit_mbps > 0 else None
+    logger.info(f"[{download_id}] Speed limit set to {download['limit_mbps'] or 'global'} Mbps")
+    return True
+
+
+def get_queue_position(download_id: str) -> int:
+    """1-based position of a queued download, or 0 if it is not waiting."""
+    return get_slots().queue_position(download_id)
+
+
+async def get_interrupted_downloads() -> list[dict]:
+    """
+    Get downloads left in the database by a previous run of the service
+    (e.g. container restart) that are not running now.
+    """
+    rows = await db.get_active_downloads()
+    return [row for row in rows if row["download_id"] not in _active_downloads]
+
+
+async def resume_interrupted_download(download_id: str) -> bool:
+    """
+    Restart an interrupted download from its persisted parameters. The
+    existing partial file is resumed using an HTTP Range request.
+
+    Returns:
+        True if the download was found and restarted
+    """
+    if download_id in _active_downloads:
+        return False
+    row = await db.get_download(download_id)
+    if not row:
+        return False
+
+    _active_downloads[download_id] = _new_download_state(
+        download_id=download_id,
+        url=row["url"],
+        filename=row["filename"],
+        path=row["path"],
+        cookie=row.get("cookie"),
+        headers=json.loads(row["headers"]) if row.get("headers") else None,
+        method=row.get("method") or "GET",
+        post_data=json.loads(row["post_data"]) if row.get("post_data") else None,
+        webhook_url_complete=row.get("webhook_url_complete"),
+        webhook_url_error=row.get("webhook_url_error"),
+        started_at=datetime.fromisoformat(row["started_at"]),
+    )
+    _active_downloads[download_id]["downloaded_bytes"] = row.get("downloaded_bytes") or 0
+    _active_downloads[download_id]["total_bytes"] = row.get("total_bytes")
+    _active_downloads[download_id]["progress_percent"] = row.get("progress_percent") or 0.0
+
+    task = asyncio.create_task(_download_worker(download_id))
+    _download_tasks[download_id] = task
+    logger.info(f"[{download_id}] Interrupted download restarted")
+    return True
+
+
+async def discard_interrupted_download(download_id: str) -> bool:
+    """
+    Move an interrupted download to history as cancelled.
+
+    Returns:
+        True if the download was found
+    """
+    if download_id in _active_downloads:
+        return False
+    data = await db.cancel_download(download_id)
+    return bool(data)
+
+
+def _new_download_state(
+    download_id: str,
+    url: str,
+    filename: str,
+    path: str,
+    cookie: Optional[str],
+    headers: Optional[dict[str, str]],
+    method: str,
+    post_data: Optional[dict],
+    webhook_url_complete: Optional[str],
+    webhook_url_error: Optional[str],
+    started_at: datetime,
+    limit_mbps: Optional[float] = None,
+    paused: bool = False
+) -> dict:
+    """Build the in-memory state of an active download."""
+    return {
+        "download_id": download_id,
+        "url": url,
+        "filename": filename,
+        "path": path,
+        # Legacy status reported by GET /downloads (always "downloading")
+        "status": "downloading",
+        # Detailed state: queued, downloading, paused, retrying, processing
+        "state": "queued",
+        "progress_percent": 0.0,
+        "downloaded_bytes": 0,
+        "total_bytes": None,
+        "speed_mbps": None,
+        "started_at": started_at,
+        "eta_seconds": None,
+        "cancelled": False,
+        "paused": paused,
+        "limit_mbps": limit_mbps if limit_mbps and limit_mbps > 0 else None,
+        "attempt": 0,
+        "last_error": None,
+        "cookie": cookie,
+        "headers": headers,
+        "method": method,
+        "post_data": post_data,
+        "webhook_url_complete": webhook_url_complete,
+        "webhook_url_error": webhook_url_error,
+    }
+
+
 def cancel_download(download_id: str) -> bool:
     """
     Mark a download for cancellation.
@@ -122,7 +328,9 @@ async def start_download(
     method: str = "GET",
     post_data: Optional[dict] = None,
     webhook_url_complete: Optional[str] = None,
-    webhook_url_error: Optional[str] = None
+    webhook_url_error: Optional[str] = None,
+    limit_mbps: Optional[float] = None,
+    paused: bool = False
 ) -> str:
     """
     Start a new download in the background.
@@ -137,6 +345,8 @@ async def start_download(
         post_data: Optional POST data
         webhook_url_complete: Webhook URL for completion
         webhook_url_error: Webhook URL for errors
+        limit_mbps: Optional speed limit for this download
+        paused: Add the download in paused state
 
     Returns:
         Download ID
@@ -151,26 +361,21 @@ async def start_download(
     normalized_path = normalize_download_path(path)
 
     # Initialize active download state
-    _active_downloads[download_id] = {
-        "download_id": download_id,
-        "url": url,
-        "filename": safe_filename,
-        "path": normalized_path,
-        "status": "downloading",
-        "progress_percent": 0.0,
-        "downloaded_bytes": 0,
-        "total_bytes": None,
-        "speed_mbps": None,
-        "started_at": datetime.utcnow(),
-        "eta_seconds": None,
-        "cancelled": False,
-        "cookie": cookie,
-        "headers": headers,
-        "method": method,
-        "post_data": post_data,
-        "webhook_url_complete": webhook_url_complete,
-        "webhook_url_error": webhook_url_error,
-    }
+    _active_downloads[download_id] = _new_download_state(
+        download_id=download_id,
+        url=url,
+        filename=safe_filename,
+        path=normalized_path,
+        cookie=cookie,
+        headers=headers,
+        method=method,
+        post_data=post_data,
+        webhook_url_complete=webhook_url_complete,
+        webhook_url_error=webhook_url_error,
+        started_at=datetime.utcnow(),
+        limit_mbps=limit_mbps,
+        paused=paused,
+    )
 
     # Add to database
     await db.add_download(
@@ -205,11 +410,36 @@ async def _download_worker(download_id: str) -> None:
     if not download:
         return
 
-    semaphore = get_semaphore()
+    slots = get_slots()
+
+    def should_leave_queue() -> bool:
+        return is_download_cancelled(download_id) or not _is_runnable(download_id)
 
     try:
-        async with semaphore:
-            await _perform_download(download_id)
+        while True:
+            # Wait while paused (individually or globally)
+            while not is_download_cancelled(download_id) and not _is_runnable(download_id):
+                _set_state(download_id, "paused")
+                await asyncio.sleep(PAUSE_POLL_INTERVAL)
+
+            if is_download_cancelled(download_id):
+                logger.info(f"[{download_id}] Download cancelled before start")
+                await _handle_download_cancelled(download_id)
+                return
+
+            # Wait for a free download slot
+            _set_state(download_id, "queued")
+            if not await slots.acquire(download_id, should_leave_queue):
+                continue
+
+            try:
+                _set_state(download_id, "downloading")
+                outcome = await _perform_download(download_id)
+            finally:
+                slots.release()
+
+            if outcome != "paused":
+                return
     except Exception as e:
         logger.error(f"[{download_id}] Download worker error: {e}")
         await _handle_download_failure(download_id, str(e))
@@ -219,16 +449,28 @@ async def _download_worker(download_id: str) -> None:
             del _download_tasks[download_id]
 
 
-async def _perform_download(download_id: str) -> None:
+async def _interruptible_sleep(download_id: str, seconds: float) -> None:
+    """Sleep, waking up early if the download is cancelled or paused."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if is_download_cancelled(download_id) or not _is_runnable(download_id):
+            return
+        await asyncio.sleep(min(PAUSE_POLL_INTERVAL, deadline - time.monotonic()))
+
+
+async def _perform_download(download_id: str) -> Optional[str]:
     """
     Perform the download with retry logic.
 
     Args:
         download_id: Download identifier
+
+    Returns:
+        Outcome: "completed", "failed", "cancelled" or "paused"
     """
     download = _active_downloads.get(download_id)
     if not download:
-        return
+        return None
 
     url = download["url"]
     filename = download["filename"]
@@ -241,11 +483,16 @@ async def _perform_download(download_id: str) -> None:
     Path(path).mkdir(parents=True, exist_ok=True)
     filepath = os.path.join(path, filename)
 
-    while retry_count < MAX_RETRY_ATTEMPTS:
+    while retry_count < settings.get("max_retry_attempts"):
         if is_download_cancelled(download_id):
             logger.info(f"[{download_id}] Download cancelled before attempt")
             await _handle_download_cancelled(download_id)
-            return
+            return "cancelled"
+
+        if not _is_runnable(download_id):
+            return "paused"
+
+        _set_state(download_id, "downloading", attempt=retry_count + 1)
 
         try:
             # Check for existing partial file for resume
@@ -266,7 +513,11 @@ async def _perform_download(download_id: str) -> None:
 
             if success:
                 await _handle_download_complete(download_id, filepath)
-                return
+                return "completed"
+
+        except DownloadPaused:
+            logger.info(f"[{download_id}] Download paused at {format_bytes(os.path.getsize(filepath))}")
+            return "paused"
 
         except httpx.HTTPStatusError as e:
             if e.response.status_code >= 400 and e.response.status_code < 500:
@@ -274,34 +525,40 @@ async def _perform_download(download_id: str) -> None:
                 error_msg = f"HTTP {e.response.status_code}: {e.response.reason_phrase}"
                 logger.error(f"[{download_id}] Client error (no retry): {error_msg}")
                 await _handle_download_failure(download_id, error_msg)
-                return
+                return "failed"
 
             logger.warning(f"[{download_id}] HTTP error: {e}")
+            _set_state(download_id, "retrying", last_error=str(e))
 
         except httpx.TimeoutException as e:
             logger.warning(f"[{download_id}] Timeout: {e}")
+            _set_state(download_id, "retrying", last_error=f"Timeout: {e}")
 
         except httpx.RequestError as e:
             logger.warning(f"[{download_id}] Request error: {e}")
+            _set_state(download_id, "retrying", last_error=f"Request error: {e}")
 
         except Exception as e:
             logger.error(f"[{download_id}] Unexpected error: {e}")
+            _set_state(download_id, "retrying", last_error=str(e))
 
         # Check if cancelled before retry
         if is_download_cancelled(download_id):
             await _handle_download_cancelled(download_id)
-            return
+            return "cancelled"
 
         # Calculate backoff
         retry_count += 1
-        if retry_count < MAX_RETRY_ATTEMPTS:
-            backoff = RETRY_BACKOFF_BASE_SECONDS * (3 ** (retry_count - 1))  # 5s, 15s, 45s
-            logger.info(f"[{download_id}] Retry {retry_count}/{MAX_RETRY_ATTEMPTS} in {backoff}s")
-            await asyncio.sleep(backoff)
+        max_retry_attempts = settings.get("max_retry_attempts")
+        if retry_count < max_retry_attempts:
+            backoff = settings.get("retry_backoff_base_seconds") * (3 ** (retry_count - 1))  # 5s, 15s, 45s
+            logger.info(f"[{download_id}] Retry {retry_count}/{max_retry_attempts} in {backoff}s")
+            await _interruptible_sleep(download_id, backoff)
 
     # All retries exhausted
-    error_msg = f"Download failed after {MAX_RETRY_ATTEMPTS} retries"
+    error_msg = f"Download failed after {settings.get('max_retry_attempts')} retries"
     await _handle_download_failure(download_id, error_msg)
+    return "failed"
 
 
 async def _stream_download(
@@ -343,11 +600,9 @@ async def _stream_download(
     if start_byte > 0:
         headers["Range"] = f"bytes={start_byte}-"
 
-    # Calculate bandwidth limit (bytes per second)
-    bytes_per_second = (MAX_BANDWIDTH_MBPS * 1024 * 1024 / 8) if MAX_BANDWIDTH_MBPS > 0 else 0
-
-    # For bandwidth limiting - track chunk timing
-    chunk_start_time = time.time()
+    # Bandwidth limiting: per-download limit and limit shared by all downloads.
+    # Limits are re-read for every chunk so changes apply immediately.
+    download_throttle = BandwidthThrottle()
 
     # Progress tracking
     downloaded_bytes = start_byte
@@ -396,21 +651,19 @@ async def _stream_download(
                         logger.info(f"[{download_id}] Download cancelled during streaming")
                         return False
 
+                    # Check for pause (before writing, so a paused file is never complete)
+                    if not _is_runnable(download_id):
+                        raise DownloadPaused()
+
                     # Write chunk
                     f.write(chunk)
                     downloaded_bytes += len(chunk)
 
-                    # Apply bandwidth limiting using token bucket approach
-                    if bytes_per_second > 0:
-                        # Calculate how long this chunk should take at target rate
-                        expected_time = len(chunk) / bytes_per_second
-                        # Calculate actual elapsed time for this chunk
-                        actual_time = time.time() - chunk_start_time
-                        # Sleep if we're going too fast
-                        if actual_time < expected_time:
-                            await asyncio.sleep(expected_time - actual_time)
-                        # Reset chunk timer for next iteration
-                        chunk_start_time = time.time()
+                    # Apply bandwidth limiting
+                    await download_throttle.consume(len(chunk), _download_rate_limit(download_id))
+                    await _total_throttle.consume(
+                        len(chunk), mbps_to_bytes_per_second(settings.get("total_bandwidth_mbps"))
+                    )
 
                     # Update progress
                     current_time = time.time()
@@ -469,6 +722,16 @@ async def _stream_download(
     return True
 
 
+def _download_rate_limit(download_id: str) -> float:
+    """Effective per-download speed limit in bytes per second (0 = unlimited)."""
+    limits = [settings.get("max_bandwidth_mbps")]
+    download = _active_downloads.get(download_id)
+    if download and download.get("limit_mbps"):
+        limits.append(download["limit_mbps"])
+    limits = [limit for limit in limits if limit and limit > 0]
+    return mbps_to_bytes_per_second(min(limits)) if limits else 0.0
+
+
 async def _handle_download_complete(download_id: str, filepath: str) -> None:
     """
     Handle successful download completion.
@@ -485,9 +748,10 @@ async def _handle_download_complete(download_id: str, filepath: str) -> None:
     size_bytes = os.path.getsize(filepath)
     decompressed = False
 
-    # Auto decompress if enabled
-    if AUTO_DECOMPRESS:
-        decompressed_path = decompress_file(filepath)
+    # Auto decompress if enabled (in a thread so the API stays responsive)
+    if settings.get("auto_decompress"):
+        _set_state(download_id, "processing")
+        decompressed_path = await asyncio.to_thread(decompress_file, filepath)
         if decompressed_path:
             decompressed = True
             # Update size to decompressed size if single file

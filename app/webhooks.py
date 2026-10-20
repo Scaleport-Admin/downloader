@@ -12,10 +12,11 @@ from typing import Optional
 import httpx
 
 from app.models import WebhookComplete, WebhookError
+from app.settings import settings
 
 logger = logging.getLogger("file-downloader")
 
-# Configuration from environment
+# Configuration from environment (defaults; current values come from app.settings)
 WEBHOOK_RETRY_ATTEMPTS = int(os.getenv("WEBHOOK_RETRY_ATTEMPTS", "3"))
 WEBHOOK_RETRY_BACKOFF_SECONDS = int(os.getenv("WEBHOOK_RETRY_BACKOFF_SECONDS", "5"))
 
@@ -23,8 +24,8 @@ WEBHOOK_RETRY_BACKOFF_SECONDS = int(os.getenv("WEBHOOK_RETRY_BACKOFF_SECONDS", "
 async def send_webhook(
     url: str,
     payload: dict,
-    max_retries: int = WEBHOOK_RETRY_ATTEMPTS,
-    backoff_base: int = WEBHOOK_RETRY_BACKOFF_SECONDS
+    max_retries: Optional[int] = None,
+    backoff_base: Optional[int] = None
 ) -> bool:
     """
     Send a webhook with retry logic.
@@ -32,12 +33,16 @@ async def send_webhook(
     Args:
         url: Webhook URL
         payload: JSON payload to send
-        max_retries: Maximum number of retry attempts
-        backoff_base: Base backoff time in seconds
+        max_retries: Maximum number of retry attempts (default: current setting)
+        backoff_base: Base backoff time in seconds (default: current setting)
 
     Returns:
         True if webhook was sent successfully
     """
+    if max_retries is None:
+        max_retries = settings.get("webhook_retry_attempts")
+    if backoff_base is None:
+        backoff_base = settings.get("webhook_retry_backoff_seconds")
     download_id = payload.get("download_id", "unknown")
 
     for attempt in range(max_retries):

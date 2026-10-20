@@ -13,9 +13,11 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import PlainTextResponse
 
+from app import __version__, web
 from app.auth import log_insecure_warning, validate_api_key, validate_api_key_from_body
 from app.database import db
 from app.downloader import (
+    DOWNLOADS_BASE_PATH,
     cancel_download,
     get_active_downloads,
     start_download,
@@ -33,11 +35,13 @@ from app.models import (
     HistoryResponse,
 )
 from app.rate_limiter import rate_limiter
+from app.settings import settings
 from app.utils import get_disk_space_gb, setup_logging
 
 # Configuration
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 HISTORY_RETENTION_DAYS = int(os.getenv("HISTORY_RETENTION_DAYS", "30"))
+WEB_UI_ENABLED = os.getenv("WEB_UI_ENABLED", "true").lower() == "true"
 
 # Setup logging
 setup_logging(LOG_LEVEL)
@@ -52,7 +56,7 @@ async def cleanup_task() -> None:
     while True:
         try:
             await asyncio.sleep(24 * 60 * 60)  # Run every 24 hours
-            deleted = await db.cleanup_old_history(HISTORY_RETENTION_DAYS)
+            deleted = await db.cleanup_old_history(settings.get("history_retention_days"))
             if deleted > 0:
                 logger.info(f"Cleanup task: removed {deleted} old history records")
         except asyncio.CancelledError:
@@ -69,9 +73,21 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting File Downloader Service...")
     _startup_time = time.time()
+    web.startup_time = _startup_time
 
     # Connect to database
     await db.connect()
+
+    # Apply settings changed at runtime (persisted in the database)
+    await web.load_settings()
+
+    # Report downloads interrupted by a previous shutdown (they can be resumed from the web UI)
+    interrupted = await db.get_active_downloads()
+    if interrupted:
+        logger.warning(
+            f"{len(interrupted)} download(s) were interrupted by a previous shutdown; "
+            "resume or discard them in the web UI"
+        )
 
     # Log insecure mode warning if needed
     log_insecure_warning()
@@ -99,9 +115,13 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="File Downloader Service",
     description="Production-ready service for downloading large files with cookie authentication",
-    version="1.0.0",
+    version=__version__,
     lifespan=lifespan
 )
+
+if WEB_UI_ENABLED:
+    app.include_router(web.ui_router)
+    app.include_router(web.api_router)
 
 
 @app.post(
@@ -298,7 +318,7 @@ async def health_check():
     No authentication required.
     """
     active_count = len(get_active_downloads())
-    disk_space = get_disk_space_gb("/downloads")
+    disk_space = get_disk_space_gb(DOWNLOADS_BASE_PATH)
     uptime = int(time.time() - _startup_time) if _startup_time else 0
 
     return HealthResponse(

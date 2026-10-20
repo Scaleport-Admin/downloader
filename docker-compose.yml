@@ -44,7 +44,11 @@ services:
       # Download settings
       - MAX_CONCURRENT_DOWNLOADS=1
       - MAX_BANDWIDTH_MBPS=100
+      - TOTAL_BANDWIDTH_MBPS=0
       - AUTO_DECOMPRESS=true
+
+      # Web UI (http://<host>:8000/ui)
+      - WEB_UI_ENABLED=true
 
       # Retry settings
       - MAX_RETRY_ATTEMPTS=3

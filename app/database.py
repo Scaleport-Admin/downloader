@@ -123,6 +123,15 @@ class Database:
                 )
             """)
 
+            # Runtime settings overrides (JSON-encoded values)
+            await self._connection.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+
             # Initialize metrics if not exists
             for key in ["downloads_completed", "downloads_failed", "downloads_cancelled", "bytes_downloaded"]:
                 await self._connection.execute(
@@ -488,6 +497,133 @@ class Database:
                 "SELECT COUNT(*) FROM active_downloads"
             )
             return (await cursor.fetchone())[0]
+
+    async def get_history_page(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        status: Optional[str] = None,
+        search: Optional[str] = None
+    ) -> tuple[list[dict], int]:
+        """
+        Get a page of download history with optional status and text filter.
+
+        Args:
+            limit: Maximum number of records to return
+            offset: Number of records to skip
+            status: Filter by status (completed, failed, cancelled)
+            search: Case-insensitive substring of filename or URL
+
+        Returns:
+            Tuple of (list of downloads, total matching count)
+        """
+        conditions = []
+        params: list = []
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        if search:
+            conditions.append("(filename LIKE ? ESCAPE '\\' OR url LIKE ? ESCAPE '\\')")
+            pattern = "%" + search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            params.extend([pattern, pattern])
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        async with self._lock:
+            cursor = await self._connection.execute(
+                f"SELECT COUNT(*) FROM download_history {where}", params
+            )
+            total = (await cursor.fetchone())[0]
+
+            cursor = await self._connection.execute(
+                f"SELECT * FROM download_history {where} "
+                "ORDER BY completed_at DESC LIMIT ? OFFSET ?",
+                params + [limit, offset]
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows], total
+
+    async def get_history_stats(self) -> dict[str, int]:
+        """
+        Get count of history records per status.
+
+        Returns:
+            Dictionary of status to count
+        """
+        async with self._lock:
+            cursor = await self._connection.execute(
+                "SELECT status, COUNT(*) AS count FROM download_history GROUP BY status"
+            )
+            rows = await cursor.fetchall()
+            return {row["status"]: row["count"] for row in rows}
+
+    async def delete_history(self, download_id: Optional[str] = None, status: Optional[str] = None) -> int:
+        """
+        Delete history records (does not touch downloaded files or metrics).
+
+        Args:
+            download_id: Delete only this record
+            status: Delete only records with this status
+
+        Returns:
+            Number of deleted records
+        """
+        conditions = []
+        params: list = []
+        if download_id:
+            conditions.append("download_id = ?")
+            params.append(download_id)
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        async with self._lock:
+            cursor = await self._connection.execute(f"DELETE FROM download_history {where}", params)
+            deleted = cursor.rowcount
+            await self._connection.commit()
+        return deleted
+
+    async def get_settings(self) -> dict[str, str]:
+        """
+        Get all persisted settings overrides.
+
+        Returns:
+            Dictionary of setting key to JSON-encoded value
+        """
+        async with self._lock:
+            cursor = await self._connection.execute("SELECT key, value FROM settings")
+            rows = await cursor.fetchall()
+            return {row["key"]: row["value"] for row in rows}
+
+    async def set_setting(self, key: str, value: str) -> None:
+        """
+        Persist a settings override.
+
+        Args:
+            key: Setting key
+            value: JSON-encoded value
+        """
+        now = datetime.utcnow().isoformat()
+        async with self._lock:
+            await self._connection.execute(
+                """
+                INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                """,
+                (key, value, now)
+            )
+            await self._connection.commit()
+
+    async def delete_setting(self, key: str) -> None:
+        """
+        Remove a persisted settings override.
+
+        Args:
+            key: Setting key
+        """
+        async with self._lock:
+            await self._connection.execute("DELETE FROM settings WHERE key = ?", (key,))
+            await self._connection.commit()
 
     async def cleanup_old_history(self, retention_days: int = 30) -> int:
         """

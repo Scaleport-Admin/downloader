@@ -8,12 +8,43 @@ import logging
 import gzip
 import shutil
 import zipfile
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 # Configure logging
 logger = logging.getLogger("file-downloader")
+
+
+class MemoryLogHandler(logging.Handler):
+    """Keeps the most recent log records in memory for the web UI."""
+
+    def __init__(self, capacity: int = 500):
+        super().__init__()
+        self._records: deque = deque(maxlen=capacity)
+        self._counter = 0
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self._counter += 1
+            self._records.append({
+                "id": self._counter,
+                "time": datetime.utcfromtimestamp(record.created).isoformat() + "Z",
+                "level": record.levelname,
+                "message": record.getMessage(),
+            })
+        except Exception:
+            self.handleError(record)
+
+    def get_records(self, after_id: int = 0, limit: int = 500) -> list[dict]:
+        """Get records newer than after_id (oldest first)."""
+        records = [r for r in self._records if r["id"] > after_id]
+        return records[-limit:]
+
+
+# Global in-memory log buffer
+memory_log_handler = MemoryLogHandler()
 
 
 def setup_logging(log_level: str = "INFO") -> None:
@@ -41,6 +72,22 @@ def setup_logging(log_level: str = "INFO") -> None:
     # Set specific logger level
     logger.setLevel(level)
 
+    # Keep recent service log records for the web UI
+    if memory_log_handler not in logger.handlers:
+        logger.addHandler(memory_log_handler)
+
+
+def set_log_level(log_level: str) -> None:
+    """
+    Change the log level at runtime.
+
+    Args:
+        log_level: Logging level (INFO, WARNING, ERROR, DEBUG)
+    """
+    level = getattr(logging, log_level.upper(), logging.INFO)
+    logging.getLogger().setLevel(level)
+    logger.setLevel(level)
+
 
 def generate_download_id() -> str:
     """
@@ -54,7 +101,7 @@ def generate_download_id() -> str:
 
 
 def sanitize_filename(filename: str) -> str:
-    """
+    r"""
     Remove dangerous characters from filename.
 
     Removes: / \ : * ? " < > |
