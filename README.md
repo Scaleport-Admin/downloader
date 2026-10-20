@@ -17,7 +17,8 @@ A production-ready Docker container with FastAPI service for downloading large f
 - **Rate Limiting**: Per-IP rate limiting for API protection
 - **API Key Authentication**: Secure API access with key validation
 - **Web UI**: Dashboard for monitoring and managing downloads and settings (`/ui`)
-- **Pause / Resume**: Pause single downloads or everything; paused downloads continue where they stopped
+- **Pause / Resume**: Pause single downloads or everything (also for 5 min ... 6 h or a custom time, like SABnzbd); paused downloads continue where they stopped
+- **Scheduler**: Change the speed limit or pause/resume all downloads at set times on selected days
 - **Runtime Settings**: Change speed limits, concurrency, retries etc. without restart
 - **Restart Recovery**: Downloads interrupted by a restart can be resumed from the web UI
 
@@ -33,7 +34,25 @@ with your `API_KEY`. The key is stored only in your browser.
   POST data, webhooks and an optional speed limit.
 - **Historie (History)** – searchable, filterable, paginated history; delete records.
 - **Nastavení (Settings)** – all runtime settings (see below).
+- **Plánovač (Scheduler)** – scheduled actions, see below.
 - **Log** – recent service log records.
+
+The pause button in the header pauses everything; its menu pauses for 5, 15, 30
+minutes, 1, 3, 6 hours or a custom time, and the header shows the remaining time.
+Without a pause it shows the current total speed.
+
+### Scheduler
+
+Each rule runs at a time of day (container local time, set `TZ`) on selected
+weekdays and does one of:
+
+- **Speed limit** – sets the total speed limit (`TOTAL_BANDWIDTH_MBPS`, 0 = unlimited).
+  The per-download limit (`MAX_BANDWIDTH_MBPS`) still applies as a ceiling.
+- **Pause all** / **Resume all**.
+
+As in SABnzbd, a manual change stays in effect until the next scheduled action,
+and at startup the most recent past action of each kind is applied. Example:
+weekdays 08:00 limit 50 Mbps, every day 22:00 limit 0 (unlimited).
 
 Downloads interrupted by a container restart are listed on the overview and can be
 resumed (continuing from the partial file) or discarded.
@@ -50,7 +69,8 @@ database and take precedence over the environment variable until reset with
 `WEBHOOK_RETRY_ATTEMPTS`, `WEBHOOK_RETRY_BACKOFF_SECONDS`, `HISTORY_RETENTION_DAYS`,
 `LOG_LEVEL`.
 
-"Pause all" is not persisted – after a restart new downloads start normally.
+A manual "pause all" (including a timed pause) is not persisted – after a restart new
+downloads start normally (unless a scheduled pause applies).
 
 ### Management API
 
@@ -66,7 +86,10 @@ unchanged.
 | POST | `/api/downloads/{id}/resume` | Resume a download |
 | PATCH | `/api/downloads/{id}` | Set per-download speed limit `{"limit_mbps": 50}` |
 | DELETE | `/api/downloads/{id}` | Cancel a download |
-| POST | `/api/pause-all`, `/api/resume-all` | Pause / resume all downloads |
+| POST | `/api/pause-all` | Pause all downloads; optional body `{"minutes": 15}` resumes automatically |
+| POST | `/api/resume-all` | Resume all downloads |
+| GET / POST | `/api/schedules` | List / add scheduled actions `{"days": [0,1,2,3,4], "time": "08:00", "action": "speed_limit", "value": 50, "enabled": true}` (days: 0 = Monday; action: `speed_limit`, `pause`, `resume`) |
+| PUT / DELETE | `/api/schedules/{id}` | Change / delete a scheduled action |
 | POST | `/api/interrupted/{id}/resume` | Resume a download interrupted by a restart |
 | DELETE | `/api/interrupted/{id}` | Discard an interrupted download |
 | GET | `/api/history` | History (`limit`, `offset`, `status`, `search`) |
@@ -439,8 +462,8 @@ git checkout 3cf8f67        # or: git checkout v1.0.0
 docker-compose build && docker-compose up -d
 ```
 
-The database stays compatible in both directions: version 1.1.0 only adds a
-`settings` table, which version 1.0.0 ignores.
+The database stays compatible in both directions: version 1.1.0 only adds the
+`settings` and `schedules` tables, which version 1.0.0 ignores.
 
 ## Project Structure
 
@@ -457,6 +480,8 @@ file-downloader/
 │   ├── rate_limiter.py       # Rate limiting logic
 │   ├── metrics.py            # Prometheus metrics
 │   ├── settings.py           # Runtime settings (changeable from web UI)
+│   ├── runtime.py            # Loading / saving / applying runtime settings
+│   ├── scheduler.py          # Scheduled speed limit / pause / resume
 │   ├── throttle.py           # Bandwidth throttling and download queue
 │   ├── web.py                # Web UI and management API (/ui, /api)
 │   ├── static/index.html     # Web UI (single page, no external dependencies)

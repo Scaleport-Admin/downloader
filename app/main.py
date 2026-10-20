@@ -35,6 +35,8 @@ from app.models import (
     HistoryResponse,
 )
 from app.rate_limiter import rate_limiter
+from app.runtime import load_settings
+from app.scheduler import scheduler
 from app.settings import settings
 from app.utils import get_disk_space_gb, setup_logging
 
@@ -79,7 +81,7 @@ async def lifespan(app: FastAPI):
     await db.connect()
 
     # Apply settings changed at runtime (persisted in the database)
-    await web.load_settings()
+    await load_settings()
 
     # Report downloads interrupted by a previous shutdown (they can be resumed from the web UI)
     interrupted = await db.get_active_downloads()
@@ -95,17 +97,22 @@ async def lifespan(app: FastAPI):
     # Start cleanup task
     cleanup = asyncio.create_task(cleanup_task())
 
+    # Start scheduler (applies the most recent scheduled actions first)
+    await scheduler.reload(apply_latest=True)
+    scheduler_loop = asyncio.create_task(scheduler.run())
+
     logger.info("File Downloader Service started successfully")
 
     yield
 
     # Shutdown
     logger.info("Shutting down File Downloader Service...")
-    cleanup.cancel()
-    try:
-        await cleanup
-    except asyncio.CancelledError:
-        pass
+    for task in (cleanup, scheduler_loop):
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     await db.disconnect()
     logger.info("File Downloader Service stopped")

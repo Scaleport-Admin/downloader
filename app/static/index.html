@@ -171,6 +171,25 @@ dl.kv dd { margin: 0; word-break: break-all; }
 .log .ERROR, .log .CRITICAL { color: var(--err); }
 .log .DEBUG { color: var(--muted); }
 .log time { color: var(--muted); margin-right: 8px; }
+.pause-ctl { position: relative; display: inline-flex; align-items: stretch; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+.pause-ctl > button { background: none; border: 0; color: var(--text); cursor: pointer; padding: 6px 10px; display: inline-flex; align-items: center; }
+.pause-ctl > button:hover { background: var(--surface-2); }
+.pause-ctl > button svg { width: 16px; height: 16px; }
+.pause-ctl #pc-main { border-radius: 7px 0 0 7px; }
+.pause-ctl #pc-menu-btn { border-left: 1px solid var(--border); padding: 6px 7px; }
+.pause-ctl .pc-timer { border-left: 1px solid var(--border); padding: 6px 12px; min-width: 96px; text-align: center; font-weight: 650; font-variant-numeric: tabular-nums; }
+.pause-ctl.paused { border-color: var(--warn); }
+.pause-ctl.paused .pc-timer { color: var(--warn); }
+.pc-dropdown { position: absolute; top: calc(100% + 6px); left: 0; z-index: 30; min-width: 210px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,.18); padding: 4px 0; }
+.pc-dropdown button { display: block; width: 100%; text-align: left; background: none; border: 0; color: var(--text); font: inherit; padding: 8px 16px; cursor: pointer; }
+.pc-dropdown button:hover { background: var(--surface-2); }
+.pc-dropdown hr { border: 0; border-top: 1px solid var(--border); margin: 4px 0; }
+.days { display: flex; gap: 4px; flex-wrap: wrap; }
+.days label { display: inline-flex; align-items: center; justify-content: center; min-width: 40px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 8px; cursor: pointer; user-select: none; font-weight: 550; }
+.days input { position: absolute; opacity: 0; pointer-events: none; }
+.days label:has(input:checked) { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+.days label:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 1px; }
+tr.disabled td { opacity: .55; }
 #toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); z-index: 50; display: flex; flex-direction: column; gap: 8px; width: min(480px, calc(100% - 32px)); }
 #toast div { background: var(--text); color: var(--bg); padding: 10px 14px; border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,.2); }
 #toast div.error { background: var(--err); color: #fff; }
@@ -190,6 +209,8 @@ dl.kv dd { margin: 0; word-break: break-all; }
   td.num { display: inline-block; margin-right: 14px; color: var(--muted); }
   td:last-child { position: absolute; top: 10px; right: 0; }
   td .dl-url { max-width: none; }
+  #schedule-list tr { padding-right: 0; }
+  #schedule-list td:last-child { position: static; margin-top: 6px; }
 }
 </style>
 </head>
@@ -211,10 +232,28 @@ dl.kv dd { margin: 0; word-break: break-all; }
 <header>
   <div class="header-inner">
     <div class="brand">File Downloader <small id="version"></small></div>
+    <div class="pause-ctl" id="pause-ctl">
+      <button type="button" id="pc-main" title="Pozastavit vše" aria-label="Pozastavit vše"></button>
+      <button type="button" id="pc-menu-btn" title="Pozastavit na dobu" aria-haspopup="true" aria-expanded="false">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M7 10l5 5 5-5z"/></svg>
+      </button>
+      <span class="pc-timer" id="pc-timer">–</span>
+      <div class="pc-dropdown hidden" id="pc-dropdown" role="menu">
+        <button type="button" data-minutes="5">Pozastavit na 5 minut</button>
+        <button type="button" data-minutes="15">Pozastavit na 15 minut</button>
+        <button type="button" data-minutes="30">Pozastavit na 30 minut</button>
+        <button type="button" data-minutes="60">Pozastavit na 1 hodinu</button>
+        <button type="button" data-minutes="180">Pozastavit na 3 hodiny</button>
+        <button type="button" data-minutes="360">Pozastavit na 6 hodin</button>
+        <hr>
+        <button type="button" data-minutes="custom">Vlastní…</button>
+      </div>
+    </div>
     <nav id="nav">
       <button data-tab="overview" class="active">Přehled</button>
       <button data-tab="new">Nové stahování</button>
       <button data-tab="history">Historie</button>
+      <button data-tab="schedule">Plánovač</button>
       <button data-tab="settings">Nastavení</button>
       <button data-tab="logs">Log</button>
     </nav>
@@ -230,7 +269,7 @@ dl.kv dd { margin: 0; word-break: break-all; }
     <div id="conn-banner" class="banner err hidden">Nelze se spojit se službou – zkouším znovu…</div>
     <div id="insecure-banner" class="banner warn hidden">Služba běží bez API klíče (API_KEY není nastaven) – kdokoli v síti ji může ovládat.</div>
     <div id="paused-banner" class="banner warn hidden">
-      <b>Všechna stahování jsou pozastavena.</b> Nová stahování čekají ve frontě.
+      <span><b>Všechna stahování jsou pozastavena<span id="paused-until"></span>.</b> Nová stahování čekají ve frontě.</span>
       <span class="spacer"></span>
       <button class="btn small" data-action="resume-all">Obnovit vše</button>
     </div>
@@ -246,12 +285,6 @@ dl.kv dd { margin: 0; word-break: break-all; }
     <div class="card">
       <h2>Ovládání</h2>
       <form class="controls" id="quick-form">
-        <div class="field">
-          <label>Všechna stahování</label>
-          <div class="row">
-            <button type="button" class="btn" id="pause-all-btn" data-action="pause-all">Pozastavit vše</button>
-          </div>
-        </div>
         <div class="field">
           <label for="q-bw">Max rychlost / stahování (Mbps)</label>
           <input id="q-bw" type="number" min="0" step="any" placeholder="0 = bez limitu">
@@ -379,6 +412,61 @@ dl.kv dd { margin: 0; word-break: break-all; }
     </div>
   </section>
 
+  <!-- Schedule -->
+  <section id="tab-schedule" class="hidden">
+    <div class="card">
+      <h2>Časový plán <span class="count" id="schedule-count"></span></h2>
+      <p class="muted" style="margin-top:-6px">V zadaný čas se nastaví celkový limit rychlosti nebo se pozastaví či obnoví všechna stahování.
+        Ruční změna platí do další naplánované akce. Po restartu služby se použije poslední akce, která už proběhla.
+        <span id="schedule-clock"></span></p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Dny</th><th>Čas</th><th>Akce</th><th>Příští spuštění</th><th>Aktivní</th><th></th></tr></thead>
+          <tbody id="schedule-list"></tbody>
+        </table>
+      </div>
+    </div>
+    <form class="card" id="schedule-form">
+      <h2 id="schedule-form-title">Přidat pravidlo</h2>
+      <div class="field">
+        <label>Dny</label>
+        <div class="days" id="sch-days"></div>
+        <div class="row" style="margin-top:6px">
+          <button type="button" class="btn small" data-days="0,1,2,3,4">Pracovní dny</button>
+          <button type="button" class="btn small" data-days="5,6">Víkend</button>
+          <button type="button" class="btn small" data-days="0,1,2,3,4,5,6">Každý den</button>
+        </div>
+      </div>
+      <div class="grid2">
+        <div class="field">
+          <label for="sch-time">Čas</label>
+          <input id="sch-time" type="time" required value="08:00">
+        </div>
+        <div class="field">
+          <label for="sch-action">Akce</label>
+          <select id="sch-action">
+            <option value="speed_limit">Nastavit celkový limit rychlosti</option>
+            <option value="pause">Pozastavit vše</option>
+            <option value="resume">Obnovit vše</option>
+          </select>
+        </div>
+        <div class="field" id="sch-value-field">
+          <label for="sch-value">Limit (Mbps)</label>
+          <input id="sch-value" type="number" min="0" step="any" value="0">
+          <span class="hint">0 = bez limitu. Limit na jedno stahování z Nastavení platí dál.</span>
+        </div>
+      </div>
+      <div class="field">
+        <label class="row" style="font-weight:400"><input id="sch-enabled" type="checkbox" checked> Pravidlo je aktivní</label>
+      </div>
+      <div id="schedule-error" class="err-text"></div>
+      <div class="row">
+        <button type="submit" class="btn primary" id="sch-submit">Přidat</button>
+        <button type="button" class="btn hidden" id="sch-cancel">Zrušit úpravy</button>
+      </div>
+    </form>
+  </section>
+
   <!-- Settings -->
   <section id="tab-settings" class="hidden">
     <form class="card" id="settings-form">
@@ -460,8 +548,8 @@ function formatDuration(seconds) {
   const d = Math.floor(seconds / 86400), h = Math.floor(seconds % 86400 / 3600),
         m = Math.floor(seconds % 3600 / 60), s = seconds % 60;
   if (d) return `${d} d ${h} h`;
-  if (h) return `${h} h ${m} min`;
-  if (m) return `${m} min ${s} s`;
+  if (h) return m ? `${h} h ${m} min` : `${h} h`;
+  if (m) return s ? `${m} min ${s} s` : `${m} min`;
   return `${s} s`;
 }
 
@@ -596,6 +684,7 @@ function showTab(tab) {
   document.querySelectorAll("main > section").forEach((s) => s.classList.toggle("hidden", s.id !== `tab-${tab}`));
   if (tab === "history") loadHistory();
   if (tab === "settings") loadSettings();
+  if (tab === "schedule") loadSchedules();
   if (tab === "logs") loadLogs();
   storageSet("downloader.tab", tab);
 }
@@ -676,10 +765,7 @@ function renderStatus(s) {
   $("#version").textContent = `v${s.version}`;
   $("#insecure-banner").classList.toggle("hidden", !s.insecure_mode);
   $("#paused-banner").classList.toggle("hidden", !s.paused);
-
-  const pauseAll = $("#pause-all-btn");
-  pauseAll.textContent = s.paused ? "Obnovit vše" : "Pozastavit vše";
-  pauseAll.dataset.action = s.paused ? "resume-all" : "pause-all";
+  updatePauseControl(s);
 
   const active = s.active_downloads;
   const queued = active.filter((d) => d.state === "queued").length;
@@ -758,7 +844,7 @@ document.addEventListener("click", async (event) => {
 
   switch (button.dataset.action) {
     case "pause-all":
-      return action(api("POST", "/api/pause-all"), "Vše pozastaveno");
+      return action(api("POST", "/api/pause-all", {}), "Vše pozastaveno");
     case "resume-all":
       return action(api("POST", "/api/resume-all"), "Stahování obnovena");
     case "pause":
@@ -1050,6 +1136,239 @@ async function loadLogs() {
 $("#log-level").addEventListener("change", renderLogs);
 
 // ---------------------------------------------------------------------------
+// Pause control (header)
+// ---------------------------------------------------------------------------
+
+const ICON_PAUSE = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M7 5h3.5v14H7zM13.5 5H17v14h-3.5z"/></svg>';
+const ICON_PLAY = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>';
+let pauseDeadline = null;
+let globalPaused = false;
+let currentSpeed = null;
+
+function formatClock(seconds) {
+  seconds = Math.max(0, Math.ceil(seconds));
+  const h = Math.floor(seconds / 3600), m = Math.floor(seconds % 3600 / 60), s = seconds % 60;
+  return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
+function renderPauseTimer() {
+  const timer = $("#pc-timer");
+  if (!globalPaused) {
+    timer.textContent = currentSpeed === null ? "–" : formatSpeed(currentSpeed);
+    timer.title = "Aktuální rychlost";
+    $("#paused-until").textContent = "";
+    return;
+  }
+  if (pauseDeadline) {
+    const remaining = (pauseDeadline - Date.now()) / 1000;
+    timer.textContent = formatClock(remaining);
+    timer.title = "Zbývá do obnovení";
+    const until = new Date(pauseDeadline).toLocaleTimeString("cs-CZ", { hour: "2-digit", minute: "2-digit" });
+    $("#paused-until").textContent = ` do ${until} (zbývá ${formatClock(remaining)})`;
+    if (remaining <= 0) refreshStatus();
+  } else {
+    timer.textContent = "Pozastaveno";
+    timer.title = "";
+    $("#paused-until").textContent = "";
+  }
+}
+
+function updatePauseControl(s) {
+  globalPaused = s.paused;
+  currentSpeed = s.total_speed_mbps;
+  pauseDeadline = s.pause_remaining_seconds !== null && s.pause_remaining_seconds !== undefined
+    ? Date.now() + s.pause_remaining_seconds * 1000 : null;
+  const main = $("#pc-main");
+  main.innerHTML = s.paused ? ICON_PLAY : ICON_PAUSE;
+  main.title = s.paused ? "Obnovit vše" : "Pozastavit vše";
+  main.setAttribute("aria-label", main.title);
+  $("#pause-ctl").classList.toggle("paused", s.paused);
+  renderPauseTimer();
+}
+
+function closePauseMenu() {
+  $("#pc-dropdown").classList.add("hidden");
+  $("#pc-menu-btn").setAttribute("aria-expanded", "false");
+}
+
+$("#pc-main").innerHTML = ICON_PAUSE;
+$("#pc-main").addEventListener("click", () => {
+  if (globalPaused) action(api("POST", "/api/resume-all"), "Stahování obnovena");
+  else action(api("POST", "/api/pause-all", {}), "Vše pozastaveno");
+});
+$("#pc-menu-btn").addEventListener("click", (event) => {
+  event.stopPropagation();
+  const open = $("#pc-dropdown").classList.toggle("hidden") === false;
+  $("#pc-menu-btn").setAttribute("aria-expanded", String(open));
+});
+$("#pc-dropdown").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-minutes]");
+  if (!button) return;
+  closePauseMenu();
+  let minutes = button.dataset.minutes;
+  if (minutes === "custom") {
+    const value = prompt("Pozastavit na kolik minut?", "45");
+    if (value === null) return;
+    minutes = Number(value.replace(",", "."));
+    if (!(minutes > 0)) return toast("Zadejte kladný počet minut", true);
+  }
+  action(api("POST", "/api/pause-all", { minutes: Number(minutes) }),
+    `Pozastaveno na ${formatDuration(Number(minutes) * 60)}`);
+});
+document.addEventListener("click", (event) => {
+  if (!event.target.closest("#pause-ctl")) closePauseMenu();
+});
+document.addEventListener("keydown", (event) => { if (event.key === "Escape") closePauseMenu(); });
+setInterval(() => { if (globalPaused && pauseDeadline) renderPauseTimer(); }, 1000);
+
+// ---------------------------------------------------------------------------
+// Schedules
+// ---------------------------------------------------------------------------
+
+const DAY_NAMES = ["Po", "Út", "St", "Čt", "Pá", "So", "Ne"];
+let schedules = [];
+let editingSchedule = null;
+
+$("#sch-days").innerHTML = DAY_NAMES.map((name, i) =>
+  `<label><input type="checkbox" value="${i}" ${i < 5 ? "checked" : ""}>${name}</label>`).join("");
+
+function selectedDays() {
+  return [...document.querySelectorAll("#sch-days input:checked")].map((el) => Number(el.value));
+}
+function setDays(days) {
+  document.querySelectorAll("#sch-days input").forEach((el) => { el.checked = days.includes(Number(el.value)); });
+}
+
+function describeDays(days) {
+  const key = days.join(",");
+  if (key === "0,1,2,3,4,5,6") return "Každý den";
+  if (key === "0,1,2,3,4") return "Pracovní dny";
+  if (key === "5,6") return "Víkend";
+  return days.map((d) => DAY_NAMES[d]).join(", ");
+}
+
+function describeAction(s) {
+  if (s.action === "pause") return "Pozastavit vše";
+  if (s.action === "resume") return "Obnovit vše";
+  return s.value ? `Limit rychlosti ${s.value} Mbps` : "Zrušit limit rychlosti";
+}
+
+function formatServerTime(iso) {
+  // Server local time without zone: show the wall-clock value as is
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(iso || "");
+  if (!m) return "–";
+  const date = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  const day = DAY_NAMES[(date.getDay() + 6) % 7];
+  return `${day} ${Number(m[3])}. ${Number(m[2])}. ${m[4]}:${m[5]}`;
+}
+
+function renderSchedules(data) {
+  schedules = data.schedules;
+  $("#schedule-count").textContent = schedules.length ? `(${schedules.length})` : "";
+  $("#schedule-clock").textContent = `Čas serveru: ${formatServerTime(data.server_time)}${data.timezone ? " (" + data.timezone + ")" : ""}.`;
+  $("#schedule-list").innerHTML = schedules.length ? schedules.map((s) => `
+    <tr class="${s.enabled ? "" : "disabled"}">
+      <td>${esc(describeDays(s.days))}</td>
+      <td class="num"><b>${esc(s.time)}</b></td>
+      <td>${esc(describeAction(s))}</td>
+      <td class="num">${s.enabled ? esc(formatServerTime(s.next_run)) : "–"}</td>
+      <td><input type="checkbox" data-toggle-schedule="${s.id}" ${s.enabled ? "checked" : ""} aria-label="Aktivní"></td>
+      <td><span class="row" style="gap:6px;flex-wrap:nowrap">
+        <button type="button" class="btn small" data-edit-schedule="${s.id}">Upravit</button>
+        <button type="button" class="btn small danger" data-delete-schedule="${s.id}">Smazat</button>
+      </span></td>
+    </tr>`).join("") : `<tr><td colspan="6" class="empty">Žádná pravidla. Přidejte první níže – např. v pracovní dny v 8:00 omezit rychlost na 50 Mbps a ve 22:00 limit zrušit.</td></tr>`;
+}
+
+async function loadSchedules() {
+  try {
+    renderSchedules(await api("GET", "/api/schedules"));
+  } catch (e) {
+    if (e.status !== 401) toast(e.message, true);
+  }
+}
+
+function scheduleBody(s) {
+  return { enabled: s.enabled, days: s.days, time: s.time, action: s.action, value: s.value };
+}
+
+function updateValueField() {
+  $("#sch-value-field").classList.toggle("hidden", $("#sch-action").value !== "speed_limit");
+}
+
+function resetScheduleForm() {
+  editingSchedule = null;
+  $("#schedule-form-title").textContent = "Přidat pravidlo";
+  $("#sch-submit").textContent = "Přidat";
+  $("#sch-cancel").classList.add("hidden");
+  $("#schedule-error").textContent = "";
+}
+
+$("#sch-action").addEventListener("change", updateValueField);
+$("#schedule-form").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-days]");
+  if (button) setDays(button.dataset.days.split(",").map(Number));
+});
+$("#sch-cancel").addEventListener("click", resetScheduleForm);
+
+$("#schedule-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const body = {
+    enabled: $("#sch-enabled").checked,
+    days: selectedDays(),
+    time: $("#sch-time").value,
+    action: $("#sch-action").value,
+    value: $("#sch-action").value === "speed_limit" ? Number($("#sch-value").value || 0) : null,
+  };
+  if (!body.days.length) { $("#schedule-error").textContent = "Vyberte alespoň jeden den."; return; }
+  try {
+    const data = editingSchedule
+      ? await api("PUT", `/api/schedules/${editingSchedule}`, body)
+      : await api("POST", "/api/schedules", body);
+    renderSchedules(data);
+    toast(editingSchedule ? "Pravidlo upraveno" : "Pravidlo přidáno");
+    resetScheduleForm();
+  } catch (e) {
+    $("#schedule-error").textContent = e.message;
+  }
+});
+
+$("#schedule-list").addEventListener("click", async (event) => {
+  const edit = event.target.closest("button[data-edit-schedule]");
+  const del = event.target.closest("button[data-delete-schedule]");
+  if (edit) {
+    const s = schedules.find((x) => x.id === Number(edit.dataset.editSchedule));
+    if (!s) return;
+    editingSchedule = s.id;
+    setDays(s.days);
+    $("#sch-time").value = s.time;
+    $("#sch-action").value = s.action;
+    $("#sch-value").value = s.value ?? 0;
+    $("#sch-enabled").checked = s.enabled;
+    updateValueField();
+    $("#schedule-form-title").textContent = "Upravit pravidlo";
+    $("#sch-submit").textContent = "Uložit";
+    $("#sch-cancel").classList.remove("hidden");
+    $("#schedule-form").scrollIntoView({ behavior: "smooth" });
+  }
+  if (del) {
+    if (!confirm("Smazat toto pravidlo?")) return;
+    const data = await action(api("DELETE", `/api/schedules/${del.dataset.deleteSchedule}`), "Pravidlo smazáno");
+    if (data) renderSchedules(data);
+    if (editingSchedule === Number(del.dataset.deleteSchedule)) resetScheduleForm();
+  }
+});
+
+$("#schedule-list").addEventListener("change", async (event) => {
+  const toggle = event.target.closest("input[data-toggle-schedule]");
+  if (!toggle) return;
+  const s = schedules.find((x) => x.id === Number(toggle.dataset.toggleSchedule));
+  if (!s) return;
+  const data = await action(api("PUT", `/api/schedules/${s.id}`, { ...scheduleBody(s), enabled: toggle.checked }));
+  if (data) renderSchedules(data); else loadSchedules();
+});
+
+// ---------------------------------------------------------------------------
 // Polling
 // ---------------------------------------------------------------------------
 
@@ -1057,10 +1376,9 @@ let tick = 0;
 setInterval(() => {
   if (document.hidden) return;
   tick++;
-  if (currentTab === "overview") {
-    refreshStatus();
-    if (tick % 5 === 0) refreshRecent();
-  }
+  refreshStatus();
+  if (currentTab === "overview" && tick % 5 === 0) refreshRecent();
+  if (currentTab === "schedule" && tick % 15 === 0) loadSchedules();
   if (currentTab === "logs" && tick % 2 === 0) loadLogs();
 }, 2000);
 
@@ -1074,7 +1392,7 @@ document.addEventListener("visibilitychange", () => {
 
 function startApp() {
   const savedTab = storageGet("downloader.tab");
-  showTab(["overview", "new", "history", "settings", "logs"].includes(savedTab) ? savedTab : "overview");
+  showTab(["overview", "new", "history", "schedule", "settings", "logs"].includes(savedTab) ? savedTab : "overview");
   refreshStatus();
   refreshRecent();
 }

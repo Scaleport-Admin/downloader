@@ -7,9 +7,9 @@ its behaviour unchanged) and has its own, more generous rate limit so the
 UI can poll for progress.
 """
 
-import json
 import logging
 import os
+import re
 import shutil
 import time
 from datetime import datetime
@@ -18,18 +18,18 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse, RedirectResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app import __version__
 from app.auth import is_insecure_mode, validate_api_key
 from app.database import db
 from app.downloader import (
     DOWNLOADS_BASE_PATH,
-    apply_settings,
     cancel_download,
     discard_interrupted_download,
     get_active_downloads,
     get_interrupted_downloads,
+    get_pause_remaining_seconds,
     get_queue_position,
     get_slots,
     is_globally_paused,
@@ -43,8 +43,11 @@ from app.downloader import (
 )
 from app.models import DownloadRequestBase
 from app.rate_limiter import RateLimiter
+from app.runtime import reset_setting as reset_runtime_setting
+from app.runtime import save_settings
+from app.scheduler import ACTIONS, next_occurrence, scheduler
 from app.settings import SETTING_DEFINITIONS, settings
-from app.utils import memory_log_handler, set_log_level
+from app.utils import memory_log_handler
 
 logger = logging.getLogger("file-downloader")
 
@@ -72,6 +75,45 @@ class NewDownloadRequest(DownloadRequestBase):
 
     limit_mbps: Optional[float] = Field(None, ge=0, description="Speed limit for this download")
     paused: bool = Field(False, description="Add the download paused")
+
+
+class PauseRequest(BaseModel):
+    """Request for pausing all downloads, optionally for a limited time."""
+
+    minutes: Optional[float] = Field(None, gt=0, le=60 * 24 * 365,
+                                     description="Resume automatically after this many minutes")
+
+
+class ScheduleRequest(BaseModel):
+    """A scheduled action."""
+
+    enabled: bool = True
+    days: list[int] = Field(..., description="Weekdays, 0 = Monday ... 6 = Sunday")
+    time: str = Field(..., description="Local time HH:MM")
+    action: str = Field(..., description="speed_limit, pause or resume")
+    value: Optional[float] = Field(None, ge=0, le=100000, description="Mbps for speed_limit (0 = unlimited)")
+
+    @field_validator("days")
+    @classmethod
+    def validate_days(cls, v: list[int]) -> list[int]:
+        if not v or any(d < 0 or d > 6 for d in v):
+            raise ValueError("Select at least one day (0 = Monday ... 6 = Sunday)")
+        return sorted(set(v))
+
+    @field_validator("time")
+    @classmethod
+    def validate_time(cls, v: str) -> str:
+        match = re.fullmatch(r"(\d{1,2}):(\d{2})", v.strip())
+        if not match or int(match.group(1)) > 23 or int(match.group(2)) > 59:
+            raise ValueError("Time must be HH:MM")
+        return f"{int(match.group(1)):02d}:{match.group(2)}"
+
+    @field_validator("action")
+    @classmethod
+    def validate_action(cls, v: str) -> str:
+        if v not in ACTIONS:
+            raise ValueError(f"Action must be one of {', '.join(ACTIONS)}")
+        return v
 
 
 class DownloadLimitRequest(BaseModel):
@@ -203,6 +245,7 @@ async def get_status(request: Request):
         "version": __version__,
         "insecure_mode": is_insecure_mode(),
         "paused": is_globally_paused(),
+        "pause_remaining_seconds": get_pause_remaining_seconds(),
         "uptime_seconds": int(time.time() - startup_time) if startup_time else 0,
         "total_speed_mbps": round(sum(d["speed_mbps"] or 0 for d in active), 2),
         "running": slots.active,
@@ -284,11 +327,15 @@ async def cancel_download_endpoint(request: Request, download_id: str):
 
 
 @api_router.post("/pause-all")
-async def pause_all_endpoint(request: Request):
-    """Pause all downloads (not persisted across restarts)."""
+async def pause_all_endpoint(request: Request, body: Optional[PauseRequest] = None):
+    """
+    Pause all downloads, optionally only for the given number of minutes
+    (not persisted across restarts).
+    """
     _authorize(request)
-    pause_all()
-    return {"paused": True}
+    minutes = body.minutes if body else None
+    pause_all(duration_seconds=minutes * 60 if minutes else None)
+    return {"paused": True, "pause_remaining_seconds": get_pause_remaining_seconds()}
 
 
 @api_router.post("/resume-all")
@@ -372,17 +419,6 @@ async def clear_history(
 # Settings
 # ---------------------------------------------------------------------------
 
-def _apply_runtime_settings() -> None:
-    apply_settings()
-    set_log_level(settings.get("log_level"))
-
-
-async def load_settings() -> None:
-    """Load persisted settings overrides and apply them (called at startup)."""
-    settings.load(await db.get_settings())
-    _apply_runtime_settings()
-
-
 @api_router.get("/settings")
 async def get_settings(request: Request):
     """List runtime settings with current values and defaults."""
@@ -409,14 +445,9 @@ async def update_settings(request: Request, body: dict[str, Any]):
     """
     _authorize(request)
     try:
-        validated = {key: settings.validate(key, value) for key, value in body.items()}
+        validated = await save_settings(body)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-
-    for key, value in validated.items():
-        await db.set_setting(key, json.dumps(value))
-        settings.set(key, value)
-    _apply_runtime_settings()
 
     if validated:
         logger.info(f"Settings changed: {validated}")
@@ -430,11 +461,81 @@ async def reset_setting(request: Request, key: str):
     if key not in SETTING_DEFINITIONS:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown setting: {key}")
 
-    await db.delete_setting(key)
-    settings.reset(key)
-    _apply_runtime_settings()
+    await reset_runtime_setting(key)
     logger.info(f"Setting reset to default: {key}")
     return {"settings": settings.describe()}
+
+
+# ---------------------------------------------------------------------------
+# Schedules
+# ---------------------------------------------------------------------------
+
+def _schedule_view(schedule: dict, now: datetime) -> dict:
+    upcoming = next_occurrence(schedule, now) if schedule["enabled"] else None
+    return {**schedule, "next_run": upcoming.isoformat() if upcoming else None}
+
+
+def _schedules_response() -> dict:
+    now = datetime.now()
+    return {
+        "schedules": [_schedule_view(s, now) for s in scheduler.schedules],
+        "server_time": now.isoformat(),
+        "timezone": time.strftime("%Z"),
+    }
+
+
+def _schedule_values(body: ScheduleRequest) -> dict:
+    if body.action == "speed_limit" and body.value is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Speed limit action needs a value (0 = unlimited)")
+    return {
+        "enabled": body.enabled,
+        "days": body.days,
+        "time": body.time,
+        "action": body.action,
+        "value": body.value if body.action == "speed_limit" else None,
+    }
+
+
+@api_router.get("/schedules")
+async def list_schedules(request: Request):
+    """List scheduled actions with their next run (server local time)."""
+    _authorize(request)
+    return _schedules_response()
+
+
+@api_router.post("/schedules", status_code=status.HTTP_201_CREATED)
+async def create_schedule(request: Request, body: ScheduleRequest):
+    """Add a scheduled action."""
+    _authorize(request)
+    values = _schedule_values(body)
+    schedule_id = await db.add_schedule(**values)
+    await scheduler.reload()
+    logger.info(f"Schedule #{schedule_id} added: {values}")
+    return _schedules_response()
+
+
+@api_router.put("/schedules/{schedule_id}")
+async def update_schedule(request: Request, schedule_id: int, body: ScheduleRequest):
+    """Replace a scheduled action."""
+    _authorize(request)
+    values = _schedule_values(body)
+    if not await db.update_schedule(schedule_id, **values):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schedule not found")
+    await scheduler.reload()
+    logger.info(f"Schedule #{schedule_id} changed: {values}")
+    return _schedules_response()
+
+
+@api_router.delete("/schedules/{schedule_id}")
+async def delete_schedule(request: Request, schedule_id: int):
+    """Delete a scheduled action."""
+    _authorize(request)
+    if not await db.delete_schedule(schedule_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schedule not found")
+    await scheduler.reload()
+    logger.info(f"Schedule #{schedule_id} deleted")
+    return _schedules_response()
 
 
 # ---------------------------------------------------------------------------

@@ -18,6 +18,8 @@ SLOW = "delay=0.05"  # ~1.3 MB/s from the test server
 def reset_runtime_state(client):
     """Restore default settings and resume everything after each test."""
     yield
+    for item in client.get("/api/schedules", headers=HEADERS).json()["schedules"]:
+        client.delete(f"/api/schedules/{item['id']}", headers=HEADERS)
     for item in client.get("/api/settings", headers=HEADERS).json()["settings"]:
         if item["overridden"]:
             client.delete(f"/api/settings/{item['key']}", headers=HEADERS)
@@ -154,7 +156,9 @@ def test_unknown_download_actions(client):
 
 
 def test_pause_all_holds_queue(client, file_server):
-    assert client.post("/api/pause-all", headers=HEADERS).json() == {"paused": True}
+    assert client.post("/api/pause-all", headers=HEADERS).json() == {
+        "paused": True, "pause_remaining_seconds": None
+    }
     download_id = _start(client, f"{file_server}/file/100000", "held.bin")
     _wait_state(client, download_id, "paused")
     time.sleep(0.5)
@@ -269,3 +273,116 @@ def test_legacy_download_respects_runtime_settings(client, file_server):
     _wait_state(client, download_id, "paused")
     client.post("/api/resume-all", headers=HEADERS)
     assert wait_for(lambda: _history(client, download_id))["status"] == "completed"
+
+
+def test_timed_pause_resumes_automatically(client, file_server):
+    import app.downloader as downloader
+
+    response = client.post("/api/pause-all", headers=HEADERS, json={"minutes": 15})
+    assert response.json()["pause_remaining_seconds"] == 900
+    status = client.get("/api/status", headers=HEADERS).json()
+    assert status["paused"] is True and 890 <= status["pause_remaining_seconds"] <= 900
+
+    download_id = _start(client, f"{file_server}/file/1000", "timed.bin")
+    _wait_state(client, download_id, "paused")
+
+    # Let the timer expire
+    downloader._pause_until = time.time() - 1
+    assert wait_for(lambda: _history(client, download_id))["status"] == "completed"
+    status = client.get("/api/status", headers=HEADERS).json()
+    assert status["paused"] is False and status["pause_remaining_seconds"] is None
+
+    assert client.post("/api/pause-all", headers=HEADERS, json={"minutes": 0}).status_code == 422
+
+
+def test_schedule_crud_and_validation(client):
+    body = {"days": [0, 1, 2, 3, 4], "time": "8:00", "action": "speed_limit", "value": 50}
+    response = client.post("/api/schedules", headers=HEADERS, json=body)
+    assert response.status_code == 201
+    schedule = response.json()["schedules"][0]
+    assert schedule["time"] == "08:00" and schedule["enabled"] is True and schedule["next_run"]
+
+    bad = [
+        {**body, "days": []}, {**body, "days": [7]}, {**body, "time": "24:00"},
+        {**body, "time": "abc"}, {**body, "action": "explode"},
+    ]
+    for item in bad:
+        assert client.post("/api/schedules", headers=HEADERS, json=item).status_code == 422
+    assert client.post("/api/schedules", headers=HEADERS,
+                       json={**body, "value": None}).status_code == 400
+
+    response = client.put(f"/api/schedules/{schedule['id']}", headers=HEADERS,
+                          json={**body, "action": "pause", "enabled": False})
+    updated = response.json()["schedules"][0]
+    assert updated["action"] == "pause" and updated["value"] is None and updated["next_run"] is None
+
+    assert client.delete(f"/api/schedules/{schedule['id']}", headers=HEADERS).status_code == 200
+    assert client.delete(f"/api/schedules/{schedule['id']}", headers=HEADERS).status_code == 404
+    assert client.put("/api/schedules/999999", headers=HEADERS, json=body).status_code == 404
+
+
+def test_scheduler_fires_actions(client):
+    from datetime import datetime
+    from app.scheduler import scheduler
+    import app.downloader as downloader
+
+    def run(coro_fn, *args, **kwargs):
+        import functools
+        return client.portal.call(functools.partial(coro_fn, *args, **kwargs))
+
+    every_day = list(range(7))
+    client.post("/api/schedules", headers=HEADERS,
+                json={"days": every_day, "time": "08:00", "action": "speed_limit", "value": 50})
+    client.post("/api/schedules", headers=HEADERS,
+                json={"days": every_day, "time": "22:00", "action": "speed_limit", "value": 0})
+    client.post("/api/schedules", headers=HEADERS,
+                json={"days": every_day, "time": "12:00", "action": "pause"})
+    client.post("/api/schedules", headers=HEADERS,
+                json={"days": every_day, "time": "13:00", "action": "resume"})
+    client.post("/api/schedules", headers=HEADERS,
+                json={"days": every_day, "time": "07:00", "action": "pause", "enabled": False})
+
+    def total_limit():
+        return client.get("/api/status", headers=HEADERS).json()["total_bandwidth_mbps"]
+
+    # Startup at 10:00 applies the latest actions: 08:00 limit 50, 13:00 (yesterday) resume
+    run(scheduler.reload, apply_latest=True, now=datetime(2026, 10, 20, 10, 0))
+    assert total_limit() == 50
+    assert downloader.is_globally_paused() is False
+
+    # A manual change stays until the next scheduled action
+    client.put("/api/settings", headers=HEADERS, json={"total_bandwidth_mbps": 80})
+    run(scheduler.check, now=datetime(2026, 10, 20, 11, 59))
+    assert total_limit() == 80
+
+    run(scheduler.check, now=datetime(2026, 10, 20, 12, 0, 10))
+    assert downloader.is_globally_paused() is True
+    run(scheduler.check, now=datetime(2026, 10, 20, 13, 0, 5))
+    assert downloader.is_globally_paused() is False
+
+    run(scheduler.check, now=datetime(2026, 10, 20, 22, 0, 1))
+    assert total_limit() == 0
+
+    # The disabled 07:00 pause never fires
+    run(scheduler.check, now=datetime(2026, 10, 21, 7, 0, 30))
+    assert downloader.is_globally_paused() is False
+    run(scheduler.check, now=datetime(2026, 10, 21, 8, 0, 30))
+    assert total_limit() == 50
+
+    # Adding a schedule whose time already passed today does not fire it immediately
+    from app.database import db
+    run(db.add_schedule, enabled=True, days=every_day, time="08:30", action="speed_limit", value=10)
+    run(scheduler.reload, now=datetime(2026, 10, 21, 9, 0))
+    run(scheduler.check, now=datetime(2026, 10, 21, 9, 0, 20))
+    assert total_limit() == 50
+
+
+def test_scheduler_occurrence_helpers():
+    from datetime import datetime
+    from app.scheduler import latest_occurrence, next_occurrence
+
+    weekdays = {"days": [0, 1, 2, 3, 4], "time": "08:00"}
+    saturday = datetime(2026, 10, 24, 9, 0)  # Saturday
+    assert latest_occurrence(weekdays, saturday) == datetime(2026, 10, 23, 8, 0)
+    assert next_occurrence(weekdays, saturday) == datetime(2026, 10, 26, 8, 0)
+    assert next_occurrence(weekdays, datetime(2026, 10, 26, 7, 59)) == datetime(2026, 10, 26, 8, 0)

@@ -45,6 +45,8 @@ _download_tasks: dict[str, asyncio.Task] = {}
 _download_slots: Optional[DownloadSlots] = None
 _total_throttle = BandwidthThrottle()
 _globally_paused = False
+# Wall-clock time (time.time()) when a timed global pause ends, None = until resumed
+_pause_until: Optional[float] = None
 
 
 class DownloadPaused(Exception):
@@ -114,7 +116,7 @@ def _is_runnable(download_id: str) -> bool:
     download = _active_downloads.get(download_id)
     if not download:
         return False
-    return not download.get("paused", False) and not _globally_paused
+    return not download.get("paused", False) and not is_globally_paused()
 
 
 def _set_state(download_id: str, state: str, **fields) -> None:
@@ -129,22 +131,40 @@ def _set_state(download_id: str, state: str, **fields) -> None:
 
 
 def is_globally_paused() -> bool:
-    """Check if all downloads are paused."""
+    """Check if all downloads are paused (a timed pause ends automatically)."""
+    if _globally_paused and _pause_until is not None and time.time() >= _pause_until:
+        resume_all(reason="pause timer expired")
     return _globally_paused
 
 
-def pause_all() -> None:
-    """Pause all downloads; queued and new downloads will not start until resumed."""
-    global _globally_paused
+def get_pause_remaining_seconds() -> Optional[int]:
+    """Seconds until a timed global pause ends, or None if not a timed pause."""
+    if not is_globally_paused() or _pause_until is None:
+        return None
+    return max(0, int(round(_pause_until - time.time())))
+
+
+def pause_all(duration_seconds: Optional[float] = None, reason: Optional[str] = None) -> None:
+    """
+    Pause all downloads; queued and new downloads will not start until resumed.
+
+    Args:
+        duration_seconds: Resume automatically after this time (None = until resumed)
+        reason: Optional reason for the log
+    """
+    global _globally_paused, _pause_until
     _globally_paused = True
-    logger.info("All downloads paused")
+    _pause_until = time.time() + duration_seconds if duration_seconds else None
+    suffix = f" for {round(duration_seconds / 60)} min" if duration_seconds else ""
+    logger.info(f"All downloads paused{suffix}" + (f" ({reason})" if reason else ""))
 
 
-def resume_all() -> None:
+def resume_all(reason: Optional[str] = None) -> None:
     """Resume all downloads (individually paused downloads stay paused)."""
-    global _globally_paused
+    global _globally_paused, _pause_until
     _globally_paused = False
-    logger.info("All downloads resumed")
+    _pause_until = None
+    logger.info("All downloads resumed" + (f" ({reason})" if reason else ""))
 
 
 def pause_download(download_id: str) -> bool:

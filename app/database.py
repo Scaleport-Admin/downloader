@@ -3,6 +3,7 @@ SQLite database operations for download tracking and history.
 """
 
 import asyncio
+import json
 import logging
 import os
 from datetime import datetime, timedelta
@@ -129,6 +130,18 @@ class Database:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                )
+            """)
+
+            # Scheduled actions (speed limit / pause / resume at given times)
+            await self._connection.execute("""
+                CREATE TABLE IF NOT EXISTS schedules (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    enabled BOOLEAN NOT NULL DEFAULT 1,
+                    days TEXT NOT NULL,
+                    time TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    value REAL
                 )
             """)
 
@@ -624,6 +637,68 @@ class Database:
         async with self._lock:
             await self._connection.execute("DELETE FROM settings WHERE key = ?", (key,))
             await self._connection.commit()
+
+    async def get_schedules(self) -> list[dict]:
+        """
+        Get all scheduled actions.
+
+        Returns:
+            List of schedule dictionaries (days decoded to a list)
+        """
+        async with self._lock:
+            cursor = await self._connection.execute("SELECT * FROM schedules ORDER BY time, id")
+            rows = await cursor.fetchall()
+        schedules = []
+        for row in rows:
+            data = dict(row)
+            data["enabled"] = bool(data["enabled"])
+            data["days"] = json.loads(data["days"])
+            schedules.append(data)
+        return schedules
+
+    async def add_schedule(self, enabled: bool, days: list[int], time: str, action: str,
+                           value: Optional[float]) -> int:
+        """
+        Add a scheduled action.
+
+        Returns:
+            ID of the new schedule
+        """
+        async with self._lock:
+            cursor = await self._connection.execute(
+                "INSERT INTO schedules (enabled, days, time, action, value) VALUES (?, ?, ?, ?, ?)",
+                (enabled, json.dumps(days), time, action, value)
+            )
+            await self._connection.commit()
+            return cursor.lastrowid
+
+    async def update_schedule(self, schedule_id: int, enabled: bool, days: list[int], time: str,
+                              action: str, value: Optional[float]) -> bool:
+        """
+        Replace a scheduled action.
+
+        Returns:
+            True if the schedule existed
+        """
+        async with self._lock:
+            cursor = await self._connection.execute(
+                "UPDATE schedules SET enabled = ?, days = ?, time = ?, action = ?, value = ? WHERE id = ?",
+                (enabled, json.dumps(days), time, action, value, schedule_id)
+            )
+            await self._connection.commit()
+            return cursor.rowcount > 0
+
+    async def delete_schedule(self, schedule_id: int) -> bool:
+        """
+        Delete a scheduled action.
+
+        Returns:
+            True if the schedule existed
+        """
+        async with self._lock:
+            cursor = await self._connection.execute("DELETE FROM schedules WHERE id = ?", (schedule_id,))
+            await self._connection.commit()
+            return cursor.rowcount > 0
 
     async def cleanup_old_history(self, retention_days: int = 30) -> int:
         """
