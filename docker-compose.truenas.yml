@@ -4,10 +4,17 @@
 #
 # Settings changed in the web UI (speed limits, concurrency, retries, ...) are
 # stored in /data and take precedence over the values below until reset.
+#
+# The image is built straight from GitHub (default branch) on every deploy,
+# so no local checkout is needed and an old cached image is never reused.
+# The first deploy takes a few minutes. To pin a branch or tag, append it to
+# the URL, e.g. ...downloader.git#v1.1.0
 
 services:
   file-downloader:
-    build: .
+    build:
+      context: https://github.com/Scaleport-Admin/downloader.git
+    pull_policy: build
     image: file-downloader:latest
     container_name: file-downloader
     restart: unless-stopped

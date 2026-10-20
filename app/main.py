@@ -73,7 +73,7 @@ async def lifespan(app: FastAPI):
     global _startup_time
 
     # Startup
-    logger.info("Starting File Downloader Service...")
+    logger.info(f"Starting File Downloader Service v{__version__}...")
     _startup_time = time.time()
     web.startup_time = _startup_time
 

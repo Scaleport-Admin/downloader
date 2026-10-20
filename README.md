@@ -316,6 +316,9 @@ All configuration is done via environment variables. See `.env.example` for full
 | `PORT` | `8000` | Server port |
 | `LOG_LEVEL` | `INFO` | Log level (DEBUG, INFO, WARNING, ERROR) |
 | `TZ` | `UTC` | Timezone |
+| `PUID` / `PGID` | `1000` | User/group the service runs as (ignored with `RUN_AS_ROOT`) |
+| `RUN_AS_ROOT` | `false` | Run as root (for NFS/network shares where ownership cannot be changed) |
+| `CHOWN_DOWNLOADS_RECURSIVE` | `false` | Change ownership of everything in `/downloads` at startup (slow on large datasets); by default only the directory itself |
 
 ### Optional - Rate Limiting
 
@@ -377,7 +380,14 @@ mkdir -p /mnt/pool/file-downloader/data
 
 ### 2. Update docker-compose.yml
 
-Edit volume paths in `docker-compose.yml`:
+For a TrueNAS "Custom App" (Install via YAML) use `docker-compose.truenas.yml`:
+it builds the image directly from GitHub on every deploy (`pull_policy: build`),
+so no local checkout is needed and an outdated cached `file-downloader:latest`
+image is never reused. The first line of the container log shows the running
+version (`Starting File Downloader Service v1.1.0...`).
+
+Otherwise edit the volume paths in `docker-compose.yml`:
+
 ```yaml
 volumes:
   - /mnt/pool/downloads:/downloads
