@@ -8,8 +8,8 @@ from pydantic import BaseModel, Field, field_validator
 import re
 
 
-class DownloadRequest(BaseModel):
-    """Request model for starting a new download."""
+class DownloadRequestBase(BaseModel):
+    """Download parameters shared by the public API and the web UI."""
 
     url: str = Field(..., description="URL of the file to download")
     filename: str = Field(..., description="Name for the downloaded file")
@@ -20,7 +20,22 @@ class DownloadRequest(BaseModel):
     post_data: Optional[dict] = Field(None, description="POST request body data")
     webhook_url_complete: Optional[str] = Field(None, description="Webhook URL for completion")
     webhook_url_error: Optional[str] = Field(None, description="Webhook URL for errors")
-    api_key: str = Field(..., description="API key for authentication")
+    sha256: Optional[str] = Field(None, description="Expected SHA256 checksum, verified after download")
+
+    @field_validator("sha256")
+    @classmethod
+    def validate_sha256(cls, v: Optional[str]) -> Optional[str]:
+        """Validate the checksum is 64 hex characters (optional 'sha256:' prefix)."""
+        if v is None:
+            return None
+        v = v.strip().lower()
+        if v.startswith("sha256:"):
+            v = v[len("sha256:"):].strip()
+        if not v:
+            return None
+        if not re.fullmatch(r"[0-9a-f]{64}", v):
+            raise ValueError("SHA256 must be 64 hexadecimal characters")
+        return v
 
     @field_validator("method")
     @classmethod
@@ -42,6 +57,12 @@ class DownloadRequest(BaseModel):
         if not v.startswith("/"):
             raise ValueError("Path must be absolute (start with /)")
         return v
+
+
+class DownloadRequest(DownloadRequestBase):
+    """Request model for starting a new download."""
+
+    api_key: str = Field(..., description="API key for authentication")
 
 
 class DownloadResponse(BaseModel):
@@ -123,6 +144,7 @@ class WebhookComplete(BaseModel):
     completed_at: datetime
     duration_seconds: int
     decompressed: bool
+    sha256: Optional[str] = None
 
 
 class WebhookError(BaseModel):

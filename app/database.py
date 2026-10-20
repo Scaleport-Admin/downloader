@@ -3,6 +3,7 @@ SQLite database operations for download tracking and history.
 """
 
 import asyncio
+import json
 import logging
 import os
 from datetime import datetime, timedelta
@@ -123,6 +124,32 @@ class Database:
                 )
             """)
 
+            # Runtime settings overrides (JSON-encoded values)
+            await self._connection.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+
+            # Scheduled actions (speed limit / pause / resume at given times)
+            await self._connection.execute("""
+                CREATE TABLE IF NOT EXISTS schedules (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    enabled BOOLEAN NOT NULL DEFAULT 1,
+                    days TEXT NOT NULL,
+                    time TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    value REAL
+                )
+            """)
+
+            # Columns added in later versions (older versions ignore them)
+            await self._ensure_column("active_downloads", "expected_sha256", "TEXT")
+            await self._ensure_column("download_history", "sha256", "TEXT")
+            await self._ensure_column("download_history", "expected_sha256", "TEXT")
+
             # Initialize metrics if not exists
             for key in ["downloads_completed", "downloads_failed", "downloads_cancelled", "bytes_downloaded"]:
                 await self._connection.execute(
@@ -132,6 +159,14 @@ class Database:
 
             await self._connection.commit()
             logger.info("Database tables created/verified")
+
+    async def _ensure_column(self, table: str, column: str, column_type: str) -> None:
+        """Add a column to an existing table if it is missing (caller holds the lock)."""
+        cursor = await self._connection.execute(f"PRAGMA table_info({table})")
+        columns = {row["name"] for row in await cursor.fetchall()}
+        if column not in columns:
+            await self._connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+            logger.info(f"Database migrated: added {table}.{column}")
 
     async def add_download(
         self,
@@ -144,7 +179,8 @@ class Database:
         method: str = "GET",
         post_data: Optional[str] = None,
         webhook_url_complete: Optional[str] = None,
-        webhook_url_error: Optional[str] = None
+        webhook_url_error: Optional[str] = None,
+        expected_sha256: Optional[str] = None
     ) -> None:
         """
         Add a new download to active downloads.
@@ -160,6 +196,7 @@ class Database:
             post_data: Optional JSON POST data string
             webhook_url_complete: Webhook URL for completion
             webhook_url_error: Webhook URL for errors
+            expected_sha256: Expected SHA256 of the file
         """
         now = datetime.utcnow().isoformat()
         async with self._lock:
@@ -167,11 +204,13 @@ class Database:
                 """
                 INSERT INTO active_downloads
                 (download_id, url, filename, path, status, started_at, updated_at,
-                 cookie, headers, method, post_data, webhook_url_complete, webhook_url_error)
-                VALUES (?, ?, ?, ?, 'downloading', ?, ?, ?, ?, ?, ?, ?, ?)
+                 cookie, headers, method, post_data, webhook_url_complete, webhook_url_error,
+                 expected_sha256)
+                VALUES (?, ?, ?, ?, 'downloading', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (download_id, url, filename, path, now, now,
-                 cookie, headers, method, post_data, webhook_url_complete, webhook_url_error)
+                 cookie, headers, method, post_data, webhook_url_complete, webhook_url_error,
+                 expected_sha256)
             )
             await self._connection.commit()
         logger.info(f"[{download_id}] Download added to database")
@@ -211,7 +250,9 @@ class Database:
         self,
         download_id: str,
         size_bytes: int,
-        decompressed: bool = False
+        decompressed: bool = False,
+        sha256: Optional[str] = None,
+        expected_sha256: Optional[str] = None
     ) -> dict:
         """
         Mark download as completed and move to history.
@@ -220,6 +261,8 @@ class Database:
             download_id: Download identifier
             size_bytes: Final file size
             decompressed: Whether file was decompressed
+            sha256: SHA256 of the downloaded file
+            expected_sha256: Expected SHA256 (verified) if one was given
 
         Returns:
             Download data dictionary
@@ -245,11 +288,13 @@ class Database:
                 """
                 INSERT INTO download_history
                 (download_id, url, filename, path, status, size_bytes,
-                 started_at, completed_at, duration_seconds, decompressed)
-                VALUES (?, ?, ?, ?, 'completed', ?, ?, ?, ?, ?)
+                 started_at, completed_at, duration_seconds, decompressed,
+                 sha256, expected_sha256)
+                VALUES (?, ?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (download_id, data["url"], data["filename"], data["path"],
-                 size_bytes, data["started_at"], now, duration_seconds, decompressed)
+                 size_bytes, data["started_at"], now, duration_seconds, decompressed,
+                 sha256, expected_sha256)
             )
 
             # Remove from active
@@ -488,6 +533,195 @@ class Database:
                 "SELECT COUNT(*) FROM active_downloads"
             )
             return (await cursor.fetchone())[0]
+
+    async def get_history_page(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        status: Optional[str] = None,
+        search: Optional[str] = None
+    ) -> tuple[list[dict], int]:
+        """
+        Get a page of download history with optional status and text filter.
+
+        Args:
+            limit: Maximum number of records to return
+            offset: Number of records to skip
+            status: Filter by status (completed, failed, cancelled)
+            search: Case-insensitive substring of filename or URL
+
+        Returns:
+            Tuple of (list of downloads, total matching count)
+        """
+        conditions = []
+        params: list = []
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        if search:
+            conditions.append("(filename LIKE ? ESCAPE '\\' OR url LIKE ? ESCAPE '\\')")
+            pattern = "%" + search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            params.extend([pattern, pattern])
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        async with self._lock:
+            cursor = await self._connection.execute(
+                f"SELECT COUNT(*) FROM download_history {where}", params
+            )
+            total = (await cursor.fetchone())[0]
+
+            cursor = await self._connection.execute(
+                f"SELECT * FROM download_history {where} "
+                "ORDER BY completed_at DESC LIMIT ? OFFSET ?",
+                params + [limit, offset]
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows], total
+
+    async def get_history_stats(self) -> dict[str, int]:
+        """
+        Get count of history records per status.
+
+        Returns:
+            Dictionary of status to count
+        """
+        async with self._lock:
+            cursor = await self._connection.execute(
+                "SELECT status, COUNT(*) AS count FROM download_history GROUP BY status"
+            )
+            rows = await cursor.fetchall()
+            return {row["status"]: row["count"] for row in rows}
+
+    async def delete_history(self, download_id: Optional[str] = None, status: Optional[str] = None) -> int:
+        """
+        Delete history records (does not touch downloaded files or metrics).
+
+        Args:
+            download_id: Delete only this record
+            status: Delete only records with this status
+
+        Returns:
+            Number of deleted records
+        """
+        conditions = []
+        params: list = []
+        if download_id:
+            conditions.append("download_id = ?")
+            params.append(download_id)
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        async with self._lock:
+            cursor = await self._connection.execute(f"DELETE FROM download_history {where}", params)
+            deleted = cursor.rowcount
+            await self._connection.commit()
+        return deleted
+
+    async def get_settings(self) -> dict[str, str]:
+        """
+        Get all persisted settings overrides.
+
+        Returns:
+            Dictionary of setting key to JSON-encoded value
+        """
+        async with self._lock:
+            cursor = await self._connection.execute("SELECT key, value FROM settings")
+            rows = await cursor.fetchall()
+            return {row["key"]: row["value"] for row in rows}
+
+    async def set_setting(self, key: str, value: str) -> None:
+        """
+        Persist a settings override.
+
+        Args:
+            key: Setting key
+            value: JSON-encoded value
+        """
+        now = datetime.utcnow().isoformat()
+        async with self._lock:
+            await self._connection.execute(
+                """
+                INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                """,
+                (key, value, now)
+            )
+            await self._connection.commit()
+
+    async def delete_setting(self, key: str) -> None:
+        """
+        Remove a persisted settings override.
+
+        Args:
+            key: Setting key
+        """
+        async with self._lock:
+            await self._connection.execute("DELETE FROM settings WHERE key = ?", (key,))
+            await self._connection.commit()
+
+    async def get_schedules(self) -> list[dict]:
+        """
+        Get all scheduled actions.
+
+        Returns:
+            List of schedule dictionaries (days decoded to a list)
+        """
+        async with self._lock:
+            cursor = await self._connection.execute("SELECT * FROM schedules ORDER BY time, id")
+            rows = await cursor.fetchall()
+        schedules = []
+        for row in rows:
+            data = dict(row)
+            data["enabled"] = bool(data["enabled"])
+            data["days"] = json.loads(data["days"])
+            schedules.append(data)
+        return schedules
+
+    async def add_schedule(self, enabled: bool, days: list[int], time: str, action: str,
+                           value: Optional[float]) -> int:
+        """
+        Add a scheduled action.
+
+        Returns:
+            ID of the new schedule
+        """
+        async with self._lock:
+            cursor = await self._connection.execute(
+                "INSERT INTO schedules (enabled, days, time, action, value) VALUES (?, ?, ?, ?, ?)",
+                (enabled, json.dumps(days), time, action, value)
+            )
+            await self._connection.commit()
+            return cursor.lastrowid
+
+    async def update_schedule(self, schedule_id: int, enabled: bool, days: list[int], time: str,
+                              action: str, value: Optional[float]) -> bool:
+        """
+        Replace a scheduled action.
+
+        Returns:
+            True if the schedule existed
+        """
+        async with self._lock:
+            cursor = await self._connection.execute(
+                "UPDATE schedules SET enabled = ?, days = ?, time = ?, action = ?, value = ? WHERE id = ?",
+                (enabled, json.dumps(days), time, action, value, schedule_id)
+            )
+            await self._connection.commit()
+            return cursor.rowcount > 0
+
+    async def delete_schedule(self, schedule_id: int) -> bool:
+        """
+        Delete a scheduled action.
+
+        Returns:
+            True if the schedule existed
+        """
+        async with self._lock:
+            cursor = await self._connection.execute("DELETE FROM schedules WHERE id = ?", (schedule_id,))
+            await self._connection.commit()
+            return cursor.rowcount > 0
 
     async def cleanup_old_history(self, retention_days: int = 30) -> int:
         """

@@ -1,0 +1,84 @@
+# File Downloader Service - TrueNAS Scale example
+#
+# Web UI: http://<truenas-ip>:8047/ui (log in with API_KEY)
+#
+# Settings changed in the web UI (speed limits, concurrency, retries, ...) are
+# stored in /data and take precedence over the values below until reset.
+#
+# The image is built straight from GitHub (default branch) on every deploy,
+# so no local checkout is needed and an old cached image is never reused.
+# The first deploy takes a few minutes. To pin a branch or tag, append it to
+# the URL, e.g. ...downloader.git#<branch-or-commit>
+
+services:
+  file-downloader:
+    build:
+      context: https://github.com/Scaleport-Admin/downloader.git
+    pull_policy: build
+    image: file-downloader:latest
+    container_name: file-downloader
+    restart: unless-stopped
+    ports:
+      - '8047:8047'
+    volumes:
+      - /mnt/tank/media/downloads/file-downloader:/downloads
+      - /mnt/System/configs/file-downloader/data:/data
+    environment:
+      # Timezone - also used by the scheduler in the web UI
+      - TZ=Europe/Prague
+
+      # PUID/PGID are ignored when RUN_AS_ROOT=true
+      - PUID=1000
+      - PGID=1000
+      - RUN_AS_ROOT=true
+
+      # Required - API key for the API and the web UI
+      - API_KEY=<your_api_key>
+
+      # Server settings
+      - PORT=8047
+      - LOG_LEVEL=INFO
+
+      # Rate limiting of the original API (the web UI has its own limit)
+      - RATE_LIMIT_REQUESTS=10
+      - RATE_LIMIT_WINDOW_SECONDS=60
+
+      # Download settings (defaults; can be changed in the web UI)
+      - MAX_CONCURRENT_DOWNLOADS=1
+      - MAX_BANDWIDTH_MBPS=250
+      - TOTAL_BANDWIDTH_MBPS=0
+      - AUTO_DECOMPRESS=true
+
+      # Retry settings
+      - MAX_RETRY_ATTEMPTS=3
+      - RETRY_BACKOFF_BASE_SECONDS=5
+
+      # Webhook settings
+      - WEBHOOK_RETRY_ATTEMPTS=3
+      - WEBHOOK_RETRY_BACKOFF_SECONDS=5
+
+      # Database settings
+      - DATABASE_PATH=/data/downloads.db
+      - HISTORY_RETENTION_DAYS=30
+
+      # Web UI
+      - WEB_UI_ENABLED=true
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:8047/health']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m

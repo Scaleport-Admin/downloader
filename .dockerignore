@@ -41,6 +41,8 @@ venv.bak/
 *~
 
 # Testing
+tests/
+requirements-dev.txt
 .pytest_cache/
 .coverage
 htmlcov/

@@ -2,6 +2,7 @@
 API key authentication for the file downloader service.
 """
 
+import hmac
 import logging
 import os
 from typing import Optional
@@ -105,7 +106,7 @@ def validate_api_key(
             detail="API key required. Provide via 'api_key' query parameter or 'X-API-Key' header."
         )
 
-    if provided_key != API_KEY:
+    if not hmac.compare_digest(provided_key.encode(), API_KEY.encode()):
         logger.warning(f"Invalid API key from {request.client.host if request.client else 'unknown'}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -139,7 +140,7 @@ def validate_api_key_from_body(api_key: str) -> bool:
             detail="API key required in request body"
         )
 
-    if api_key != API_KEY:
+    if not hmac.compare_digest(api_key.encode(), API_KEY.encode()):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API key"

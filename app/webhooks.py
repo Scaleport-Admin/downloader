@@ -12,10 +12,11 @@ from typing import Optional
 import httpx
 
 from app.models import WebhookComplete, WebhookError
+from app.settings import settings
 
 logger = logging.getLogger("file-downloader")
 
-# Configuration from environment
+# Configuration from environment (defaults; current values come from app.settings)
 WEBHOOK_RETRY_ATTEMPTS = int(os.getenv("WEBHOOK_RETRY_ATTEMPTS", "3"))
 WEBHOOK_RETRY_BACKOFF_SECONDS = int(os.getenv("WEBHOOK_RETRY_BACKOFF_SECONDS", "5"))
 
@@ -23,8 +24,8 @@ WEBHOOK_RETRY_BACKOFF_SECONDS = int(os.getenv("WEBHOOK_RETRY_BACKOFF_SECONDS", "
 async def send_webhook(
     url: str,
     payload: dict,
-    max_retries: int = WEBHOOK_RETRY_ATTEMPTS,
-    backoff_base: int = WEBHOOK_RETRY_BACKOFF_SECONDS
+    max_retries: Optional[int] = None,
+    backoff_base: Optional[int] = None
 ) -> bool:
     """
     Send a webhook with retry logic.
@@ -32,12 +33,16 @@ async def send_webhook(
     Args:
         url: Webhook URL
         payload: JSON payload to send
-        max_retries: Maximum number of retry attempts
-        backoff_base: Base backoff time in seconds
+        max_retries: Maximum number of retry attempts (default: current setting)
+        backoff_base: Base backoff time in seconds (default: current setting)
 
     Returns:
         True if webhook was sent successfully
     """
+    if max_retries is None:
+        max_retries = settings.get("webhook_retry_attempts")
+    if backoff_base is None:
+        backoff_base = settings.get("webhook_retry_backoff_seconds")
     download_id = payload.get("download_id", "unknown")
 
     for attempt in range(max_retries):
@@ -89,7 +94,8 @@ async def send_completion_webhook(
     size_bytes: int,
     started_at: datetime,
     completed_at: datetime,
-    decompressed: bool = False
+    decompressed: bool = False,
+    sha256: Optional[str] = None
 ) -> bool:
     """
     Send webhook notification for completed download.
@@ -103,6 +109,7 @@ async def send_completion_webhook(
         started_at: Download start time
         completed_at: Download completion time
         decompressed: Whether file was decompressed
+        sha256: SHA256 of the downloaded file
 
     Returns:
         True if webhook was sent successfully
@@ -118,7 +125,8 @@ async def send_completion_webhook(
         started_at=started_at,
         completed_at=completed_at,
         duration_seconds=duration_seconds,
-        decompressed=decompressed
+        decompressed=decompressed,
+        sha256=sha256
     )
 
     return await send_webhook(webhook_url, payload.model_dump(mode="json"))

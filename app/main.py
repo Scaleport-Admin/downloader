@@ -13,9 +13,11 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import PlainTextResponse
 
+from app import __version__, web
 from app.auth import log_insecure_warning, validate_api_key, validate_api_key_from_body
 from app.database import db
 from app.downloader import (
+    DOWNLOADS_BASE_PATH,
     cancel_download,
     get_active_downloads,
     start_download,
@@ -33,11 +35,15 @@ from app.models import (
     HistoryResponse,
 )
 from app.rate_limiter import rate_limiter
+from app.runtime import load_settings
+from app.scheduler import scheduler
+from app.settings import settings
 from app.utils import get_disk_space_gb, setup_logging
 
 # Configuration
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 HISTORY_RETENTION_DAYS = int(os.getenv("HISTORY_RETENTION_DAYS", "30"))
+WEB_UI_ENABLED = os.getenv("WEB_UI_ENABLED", "true").lower() == "true"
 
 # Setup logging
 setup_logging(LOG_LEVEL)
@@ -52,7 +58,7 @@ async def cleanup_task() -> None:
     while True:
         try:
             await asyncio.sleep(24 * 60 * 60)  # Run every 24 hours
-            deleted = await db.cleanup_old_history(HISTORY_RETENTION_DAYS)
+            deleted = await db.cleanup_old_history(settings.get("history_retention_days"))
             if deleted > 0:
                 logger.info(f"Cleanup task: removed {deleted} old history records")
         except asyncio.CancelledError:
@@ -67,11 +73,23 @@ async def lifespan(app: FastAPI):
     global _startup_time
 
     # Startup
-    logger.info("Starting File Downloader Service...")
+    logger.info(f"Starting File Downloader Service v{__version__}...")
     _startup_time = time.time()
+    web.startup_time = _startup_time
 
     # Connect to database
     await db.connect()
+
+    # Apply settings changed at runtime (persisted in the database)
+    await load_settings()
+
+    # Report downloads interrupted by a previous shutdown (they can be resumed from the web UI)
+    interrupted = await db.get_active_downloads()
+    if interrupted:
+        logger.warning(
+            f"{len(interrupted)} download(s) were interrupted by a previous shutdown; "
+            "resume or discard them in the web UI"
+        )
 
     # Log insecure mode warning if needed
     log_insecure_warning()
@@ -79,17 +97,22 @@ async def lifespan(app: FastAPI):
     # Start cleanup task
     cleanup = asyncio.create_task(cleanup_task())
 
+    # Start scheduler (applies the most recent scheduled actions first)
+    await scheduler.reload(apply_latest=True)
+    scheduler_loop = asyncio.create_task(scheduler.run())
+
     logger.info("File Downloader Service started successfully")
 
     yield
 
     # Shutdown
     logger.info("Shutting down File Downloader Service...")
-    cleanup.cancel()
-    try:
-        await cleanup
-    except asyncio.CancelledError:
-        pass
+    for task in (cleanup, scheduler_loop):
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     await db.disconnect()
     logger.info("File Downloader Service stopped")
@@ -99,9 +122,13 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="File Downloader Service",
     description="Production-ready service for downloading large files with cookie authentication",
-    version="1.0.0",
+    version=__version__,
     lifespan=lifespan
 )
+
+if WEB_UI_ENABLED:
+    app.include_router(web.ui_router)
+    app.include_router(web.api_router)
 
 
 @app.post(
@@ -137,7 +164,8 @@ async def create_download(request: Request, download_request: DownloadRequest):
         method=download_request.method,
         post_data=download_request.post_data,
         webhook_url_complete=download_request.webhook_url_complete,
-        webhook_url_error=download_request.webhook_url_error
+        webhook_url_error=download_request.webhook_url_error,
+        expected_sha256=download_request.sha256
     )
 
     return DownloadResponse(
@@ -298,7 +326,7 @@ async def health_check():
     No authentication required.
     """
     active_count = len(get_active_downloads())
-    disk_space = get_disk_space_gb("/downloads")
+    disk_space = get_disk_space_gb(DOWNLOADS_BASE_PATH)
     uptime = int(time.time() - _startup_time) if _startup_time else 0
 
     return HealthResponse(
@@ -340,4 +368,4 @@ if __name__ == "__main__":
     import uvicorn
 
     port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=port, timeout_graceful_shutdown=5)

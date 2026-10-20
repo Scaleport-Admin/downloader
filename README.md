@@ -16,6 +16,109 @@ A production-ready Docker container with FastAPI service for downloading large f
 - **SQLite Persistence**: Download history with configurable retention
 - **Rate Limiting**: Per-IP rate limiting for API protection
 - **API Key Authentication**: Secure API access with key validation
+- **Web UI**: Dashboard for monitoring and managing downloads and settings (`/ui`)
+- **Pause / Resume**: Pause single downloads or everything (also for 5 min ... 6 h or a custom time, like SABnzbd); paused downloads continue where they stopped
+- **Scheduler**: Change the speed limit or pause/resume all downloads at set times on selected days
+- **Integrity Check**: SHA256 of every download is computed while streaming and optionally verified against an expected value
+- **Live Updates**: The web UI receives changes instantly via Server-Sent Events (falls back to polling)
+- **Runtime Settings**: Change speed limits, concurrency, retries etc. without restart
+- **Restart Recovery**: Downloads interrupted by a restart can be resumed from the web UI
+
+## Web UI
+
+Open `http://<host>:8000/ui` (the service root `/` redirects there) and log in
+with your `API_KEY`. The key is stored only in your browser.
+
+- **Přehled (Overview)** – current speed, running/queued downloads, free disk space,
+  progress with speed and ETA. Pause/resume/cancel each download, set a per-download
+  speed limit, pause everything with one click, change speed limits and concurrency.
+- **Nové stahování (New download)** – start a download including cookie, headers,
+  POST data, webhooks and an optional speed limit.
+- **Historie (History)** – searchable, filterable, paginated history; delete records.
+- **Nastavení (Settings)** – all runtime settings (see below).
+- **Plánovač (Scheduler)** – scheduled actions, see below.
+- **Log** – recent service log records.
+
+The pause button in the header pauses everything; its menu pauses for 5, 15, 30
+minutes, 1, 3, 6 hours or a custom time, and the header shows the remaining time.
+Without a pause it shows the current total speed.
+
+### Scheduler
+
+Each rule runs at a time of day (container local time, set `TZ`) on selected
+weekdays and does one of:
+
+- **Speed limit** – sets the total speed limit (`TOTAL_BANDWIDTH_MBPS`, 0 = unlimited).
+  The per-download limit (`MAX_BANDWIDTH_MBPS`) still applies as a ceiling.
+- **Pause all** / **Resume all**.
+
+As in SABnzbd, a manual change stays in effect until the next scheduled action,
+and at startup the most recent past action of each kind is applied. Example:
+weekdays 08:00 limit 50 Mbps, every day 22:00 limit 0 (unlimited).
+
+### Integrity check (SHA256)
+
+The SHA256 of every download is computed while it is being downloaded (no
+second pass over the file, works across pause, retry and restart) and shown in
+the history. If `sha256` is given when starting a download (optional, also in
+`POST /download`; a `sha256:` prefix and upper case are accepted), the file is
+verified before decompression. On a mismatch the download is marked as failed
+and the file is renamed to `<name>.sha256-mismatch` (kept, not deleted). The
+completion webhook contains the `sha256` field.
+
+### Live updates
+
+The web UI keeps one connection to `GET /api/events` (Server-Sent Events,
+authenticated with the `X-API-Key` header) and receives status changes and
+log records as they happen. The green dot next to the version shows a live
+connection; without it (e.g. a proxy that buffers responses) the UI polls
+every 2 seconds and reconnects automatically. Behind nginx the endpoint sends
+`X-Accel-Buffering: no`.
+
+Downloads interrupted by a container restart are listed on the overview and can be
+resumed (continuing from the partial file) or discarded.
+
+### Runtime settings
+
+These settings start with the value of their environment variable. When changed in
+the web UI they apply immediately (also to running downloads), are stored in the
+database and take precedence over the environment variable until reset with
+"Výchozí" (default):
+
+`MAX_CONCURRENT_DOWNLOADS`, `MAX_BANDWIDTH_MBPS`, `TOTAL_BANDWIDTH_MBPS`,
+`AUTO_DECOMPRESS`, `MAX_RETRY_ATTEMPTS`, `RETRY_BACKOFF_BASE_SECONDS`,
+`WEBHOOK_RETRY_ATTEMPTS`, `WEBHOOK_RETRY_BACKOFF_SECONDS`, `HISTORY_RETENTION_DAYS`,
+`LOG_LEVEL`.
+
+A manual "pause all" (including a timed pause) is not persisted – after a restart new
+downloads start normally (unless a scheduled pause applies).
+
+### Management API
+
+The web UI uses a JSON API under `/api` (authentication via the `X-API-Key` header,
+separate rate limit `UI_RATE_LIMIT_REQUESTS`). The original endpoints below are
+unchanged.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/status` | Dashboard data (active, queued, interrupted downloads, disk, totals) |
+| GET | `/api/events` | Live updates (Server-Sent Events): `status` and `logs` events |
+| POST | `/api/downloads` | Start a download (same fields as `POST /download` without `api_key`, plus `limit_mbps`, `paused`); `sha256` verifies the file |
+| POST | `/api/downloads/{id}/pause` | Pause a download |
+| POST | `/api/downloads/{id}/resume` | Resume a download |
+| PATCH | `/api/downloads/{id}` | Set per-download speed limit `{"limit_mbps": 50}` |
+| DELETE | `/api/downloads/{id}` | Cancel a download |
+| POST | `/api/pause-all` | Pause all downloads; optional body `{"minutes": 15}` resumes automatically |
+| POST | `/api/resume-all` | Resume all downloads |
+| GET / POST | `/api/schedules` | List / add scheduled actions `{"days": [0,1,2,3,4], "time": "08:00", "action": "speed_limit", "value": 50, "enabled": true}` (days: 0 = Monday; action: `speed_limit`, `pause`, `resume`) |
+| PUT / DELETE | `/api/schedules/{id}` | Change / delete a scheduled action |
+| POST | `/api/interrupted/{id}/resume` | Resume a download interrupted by a restart |
+| DELETE | `/api/interrupted/{id}` | Discard an interrupted download |
+| GET | `/api/history` | History (`limit`, `offset`, `status`, `search`) |
+| DELETE | `/api/history/{id}`, `/api/history?status=` | Delete history records (files are kept) |
+| GET / PUT | `/api/settings` | Read / change runtime settings |
+| DELETE | `/api/settings/{key}` | Reset a setting to its environment value |
+| GET | `/api/logs` | Recent log records (`after` = last seen id) |
 
 ## Quick Start
 
@@ -74,7 +177,8 @@ curl -X POST http://localhost:8000/download \
       "User-Agent": "Mozilla/5.0"
     },
     "webhook_url_complete": "https://webhook.site/xxx",
-    "webhook_url_error": "https://webhook.site/xxx"
+    "webhook_url_error": "https://webhook.site/xxx",
+    "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
   }'
 ```
 
@@ -235,6 +339,9 @@ All configuration is done via environment variables. See `.env.example` for full
 | `PORT` | `8000` | Server port |
 | `LOG_LEVEL` | `INFO` | Log level (DEBUG, INFO, WARNING, ERROR) |
 | `TZ` | `UTC` | Timezone |
+| `PUID` / `PGID` | `1000` | User/group the service runs as (ignored with `RUN_AS_ROOT`) |
+| `RUN_AS_ROOT` | `false` | Run as root (for NFS/network shares where ownership cannot be changed) |
+| `CHOWN_DOWNLOADS_RECURSIVE` | `false` | Change ownership of everything in `/downloads` at startup (slow on large datasets); by default only the directory itself |
 
 ### Optional - Rate Limiting
 
@@ -248,8 +355,17 @@ All configuration is done via environment variables. See `.env.example` for full
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MAX_CONCURRENT_DOWNLOADS` | `1` | Maximum concurrent downloads |
-| `MAX_BANDWIDTH_MBPS` | `0` | Max bandwidth (0 = unlimited) |
+| `MAX_BANDWIDTH_MBPS` | `0` | Max bandwidth per download (0 = unlimited) |
+| `TOTAL_BANDWIDTH_MBPS` | `0` | Max bandwidth shared by all downloads (0 = unlimited) |
 | `AUTO_DECOMPRESS` | `true` | Auto-decompress .gz/.zip files |
+
+### Optional - Web UI
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WEB_UI_ENABLED` | `true` | Enable web UI (`/ui`) and management API (`/api`) |
+| `UI_RATE_LIMIT_REQUESTS` | `600` | Max management API requests per window per IP |
+| `UI_RATE_LIMIT_WINDOW_SECONDS` | `60` | Management API rate limit window |
 
 ### Optional - Retry Settings
 
@@ -287,7 +403,14 @@ mkdir -p /mnt/pool/file-downloader/data
 
 ### 2. Update docker-compose.yml
 
-Edit volume paths in `docker-compose.yml`:
+For a TrueNAS "Custom App" (Install via YAML) use `docker-compose.truenas.yml`:
+it builds the image directly from GitHub on every deploy (`pull_policy: build`),
+so no local checkout is needed and an outdated cached `file-downloader:latest`
+image is never reused. The first line of the container log shows the running
+version (`Starting File Downloader Service v1.2.0...`).
+
+Otherwise edit the volume paths in `docker-compose.yml`:
+
 ```yaml
 volumes:
   - /mnt/pool/downloads:/downloads
@@ -328,7 +451,8 @@ curl http://your-truenas-ip:8000/health
   "started_at": "2025-01-15T10:30:00Z",
   "completed_at": "2025-01-15T10:35:23Z",
   "duration_seconds": 323,
-  "decompressed": true
+  "decompressed": true,
+  "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
 }
 ```
 
@@ -353,6 +477,29 @@ curl http://your-truenas-ip:8000/health
 - **Rate Limiting**: Prevents API abuse with per-IP rate limiting
 - **Non-root Container**: Runs as non-privileged user inside container
 
+## Development
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+pytest
+```
+
+The test suite contains regression tests for the original API (`tests/test_legacy_api.py`)
+and tests for the web UI API (`tests/test_web_api.py`).
+
+## Rollback
+
+Version 1.0.0 (before the web UI) is commit `3cf8f67` (tag `v1.0.0`). To go back:
+
+```bash
+git checkout 3cf8f67        # or: git checkout v1.0.0
+docker-compose build && docker-compose up -d
+```
+
+The database stays compatible in both directions: newer versions only add tables
+(`settings`, `schedules`) and columns (`sha256`, `expected_sha256`), which
+version 1.0.0 ignores.
+
 ## Project Structure
 
 ```
@@ -367,7 +514,15 @@ file-downloader/
 │   ├── auth.py               # API key validation
 │   ├── rate_limiter.py       # Rate limiting logic
 │   ├── metrics.py            # Prometheus metrics
+│   ├── settings.py           # Runtime settings (changeable from web UI)
+│   ├── runtime.py            # Loading / saving / applying runtime settings
+│   ├── scheduler.py          # Scheduled speed limit / pause / resume
+│   ├── events.py             # Change notifications for live updates (SSE)
+│   ├── throttle.py           # Bandwidth throttling and download queue
+│   ├── web.py                # Web UI and management API (/ui, /api)
+│   ├── static/index.html     # Web UI (single page, no external dependencies)
 │   └── utils.py              # Helper functions
+├── tests/                    # pytest test suite
 ├── Dockerfile                # Multi-stage Docker build
 ├── docker-compose.yml        # Docker Compose config
 ├── requirements.txt          # Python dependencies
