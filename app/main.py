@@ -164,7 +164,8 @@ async def create_download(request: Request, download_request: DownloadRequest):
         method=download_request.method,
         post_data=download_request.post_data,
         webhook_url_complete=download_request.webhook_url_complete,
-        webhook_url_error=download_request.webhook_url_error
+        webhook_url_error=download_request.webhook_url_error,
+        expected_sha256=download_request.sha256
     )
 
     return DownloadResponse(
@@ -367,4 +368,4 @@ if __name__ == "__main__":
     import uvicorn
 
     port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=port, timeout_graceful_shutdown=5)

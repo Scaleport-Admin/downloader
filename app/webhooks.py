@@ -94,7 +94,8 @@ async def send_completion_webhook(
     size_bytes: int,
     started_at: datetime,
     completed_at: datetime,
-    decompressed: bool = False
+    decompressed: bool = False,
+    sha256: Optional[str] = None
 ) -> bool:
     """
     Send webhook notification for completed download.
@@ -108,6 +109,7 @@ async def send_completion_webhook(
         started_at: Download start time
         completed_at: Download completion time
         decompressed: Whether file was decompressed
+        sha256: SHA256 of the downloaded file
 
     Returns:
         True if webhook was sent successfully
@@ -123,7 +125,8 @@ async def send_completion_webhook(
         started_at=started_at,
         completed_at=completed_at,
         duration_seconds=duration_seconds,
-        decompressed=decompressed
+        decompressed=decompressed,
+        sha256=sha256
     )
 
     return await send_webhook(webhook_url, payload.model_dump(mode="json"))

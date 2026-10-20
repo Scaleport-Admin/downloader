@@ -345,35 +345,37 @@ def test_scheduler_fires_actions(client):
     def total_limit():
         return client.get("/api/status", headers=HEADERS).json()["total_bandwidth_mbps"]
 
+    # Fake dates lie in the future so they never collide with the real clock
+    # used when the API reloads the schedules
     # Startup at 10:00 applies the latest actions: 08:00 limit 50, 13:00 (yesterday) resume
-    run(scheduler.reload, apply_latest=True, now=datetime(2026, 10, 20, 10, 0))
+    run(scheduler.reload, apply_latest=True, now=datetime(2030, 1, 8, 10, 0))
     assert total_limit() == 50
     assert downloader.is_globally_paused() is False
 
     # A manual change stays until the next scheduled action
     client.put("/api/settings", headers=HEADERS, json={"total_bandwidth_mbps": 80})
-    run(scheduler.check, now=datetime(2026, 10, 20, 11, 59))
+    run(scheduler.check, now=datetime(2030, 1, 8, 11, 59))
     assert total_limit() == 80
 
-    run(scheduler.check, now=datetime(2026, 10, 20, 12, 0, 10))
+    run(scheduler.check, now=datetime(2030, 1, 8, 12, 0, 10))
     assert downloader.is_globally_paused() is True
-    run(scheduler.check, now=datetime(2026, 10, 20, 13, 0, 5))
+    run(scheduler.check, now=datetime(2030, 1, 8, 13, 0, 5))
     assert downloader.is_globally_paused() is False
 
-    run(scheduler.check, now=datetime(2026, 10, 20, 22, 0, 1))
+    run(scheduler.check, now=datetime(2030, 1, 8, 22, 0, 1))
     assert total_limit() == 0
 
     # The disabled 07:00 pause never fires
-    run(scheduler.check, now=datetime(2026, 10, 21, 7, 0, 30))
+    run(scheduler.check, now=datetime(2030, 1, 9, 7, 0, 30))
     assert downloader.is_globally_paused() is False
-    run(scheduler.check, now=datetime(2026, 10, 21, 8, 0, 30))
+    run(scheduler.check, now=datetime(2030, 1, 9, 8, 0, 30))
     assert total_limit() == 50
 
     # Adding a schedule whose time already passed today does not fire it immediately
     from app.database import db
     run(db.add_schedule, enabled=True, days=every_day, time="08:30", action="speed_limit", value=10)
-    run(scheduler.reload, now=datetime(2026, 10, 21, 9, 0))
-    run(scheduler.check, now=datetime(2026, 10, 21, 9, 0, 20))
+    run(scheduler.reload, now=datetime(2030, 1, 9, 9, 0))
+    run(scheduler.check, now=datetime(2030, 1, 9, 9, 0, 20))
     assert total_limit() == 50
 
 
@@ -386,3 +388,123 @@ def test_scheduler_occurrence_helpers():
     assert latest_occurrence(weekdays, saturday) == datetime(2026, 10, 23, 8, 0)
     assert next_occurrence(weekdays, saturday) == datetime(2026, 10, 26, 8, 0)
     assert next_occurrence(weekdays, datetime(2026, 10, 26, 7, 59)) == datetime(2026, 10, 26, 8, 0)
+
+
+def _sha256(data: bytes) -> str:
+    import hashlib
+    return hashlib.sha256(data).hexdigest()
+
+
+def test_checksum_computed_and_verified(client, file_server, downloads_dir):
+    size = 500_000
+    expected = _sha256(file_content(size))
+
+    # Without expected checksum: computed and shown in history
+    download_id = _start(client, f"{file_server}/file/{size}", "sum-plain.bin")
+    entry = wait_for(lambda: _history(client, download_id))
+    assert entry["status"] == "completed"
+    assert entry["sha256"] == expected and entry["checksum_verified"] is False
+
+    # With expected checksum (prefix and uppercase accepted), via the original API
+    response = client.post("/download", json={
+        "url": f"{file_server}/file/{size}", "filename": "sum-verified.bin", "path": "/web",
+        "api_key": API_KEY, "sha256": "sha256:" + expected.upper(),
+    })
+    assert response.status_code == 202
+    entry = wait_for(lambda: _history(client, response.json()["download_id"]))
+    assert entry["status"] == "completed" and entry["checksum_verified"] is True
+
+    # Legacy history response keeps its fields
+    legacy = client.get("/downloads/history", params={"api_key": API_KEY}).json()["downloads"][0]
+    assert "sha256" not in legacy
+
+
+def test_checksum_mismatch_fails_and_keeps_file(client, file_server, downloads_dir):
+    download_id = _start(client, f"{file_server}/file/100000", "sum-bad.bin", sha256="0" * 64)
+    entry = wait_for(lambda: _history(client, download_id))
+    assert entry["status"] == "failed"
+    assert entry["error_message"].startswith("SHA256 mismatch: expected " + "0" * 64)
+    target = os.path.join(downloads_dir, "web", "sum-bad.bin")
+    assert not os.path.exists(target)
+    assert os.path.getsize(target + ".sha256-mismatch") == 100000
+
+
+def test_checksum_invalid_value(client, file_server):
+    for value in ("abc", "g" * 64, "0" * 63):
+        response = client.post("/api/downloads", headers=HEADERS, json={
+            "url": f"{file_server}/file/10", "filename": "x.bin", "path": "/web", "sha256": value
+        })
+        assert response.status_code == 422
+
+
+def test_checksum_survives_pause_and_restart(client, file_server, downloads_dir):
+    from app.database import db
+
+    size = 3_000_000
+    expected = _sha256(file_content(size))
+
+    # Pause / resume within one run: streaming hash continues
+    download_id = _start(client, f"{file_server}/file/{size}?{SLOW}", "sum-pause.bin", sha256=expected)
+    wait_for(lambda: (d := _active(client, download_id)) and d["downloaded_bytes"] > 200_000)
+    client.post(f"/api/downloads/{download_id}/pause", headers=HEADERS)
+    _wait_state(client, download_id, "paused")
+    client.post(f"/api/downloads/{download_id}/resume", headers=HEADERS)
+    entry = wait_for(lambda: _history(client, download_id), timeout=20)
+    assert entry["status"] == "completed" and entry["checksum_verified"] is True
+
+    # Interrupted by a restart: the partial file is hashed before resuming
+    size = 400_000
+    target_dir = os.path.join(downloads_dir, "sum-restart")
+    os.makedirs(target_dir, exist_ok=True)
+    with open(os.path.join(target_dir, "part.bin"), "wb") as f:
+        f.write(file_content(size)[:150_000])
+    client.portal.call(functools.partial(
+        db.add_download, download_id="dl_sum_orphan", url=f"{file_server}/file/{size}",
+        filename="part.bin", path=target_dir, expected_sha256=_sha256(file_content(size))
+    ))
+    client.post("/api/interrupted/dl_sum_orphan/resume", headers=HEADERS)
+    entry = wait_for(lambda: _history(client, "dl_sum_orphan"))
+    assert entry["status"] == "completed" and entry["checksum_verified"] is True
+
+
+def test_event_stream(client, file_server):
+    import json
+    from app.web import event_stream
+
+    async def collect(count, action=None):
+        stream = event_stream()
+        items = []
+        try:
+            async for item in stream:
+                items.append(item)
+                if len(items) == 2 and action:
+                    await action()
+                if len(items) >= count:
+                    break
+        finally:
+            await stream.aclose()
+        return items
+
+    items = client.portal.call(collect, 3)
+    assert items[0].startswith("retry:")
+    assert items[1].startswith("event: status\ndata: ")
+    status = json.loads(items[1].split("data: ", 1)[1])
+    assert "active_downloads" in status
+    assert items[2].startswith("event: logs\ndata: ")
+
+    # A change is pushed right away (well under the 1 s interval)
+    import time as _time
+    from app.downloader import pause_all
+
+    async def do_pause():
+        pause_all()
+
+    started = _time.monotonic()
+    items = client.portal.call(collect, 4, do_pause)
+    assert _time.monotonic() - started < 0.9
+    pushed = [json.loads(i.split("data: ", 1)[1]) for i in items[2:] if i.startswith("event: status")]
+    assert pushed and pushed[-1]["paused"] is True
+
+
+def test_events_endpoint_requires_key(client):
+    assert client.get("/api/events").status_code == 401

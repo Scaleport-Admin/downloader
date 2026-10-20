@@ -3,6 +3,7 @@ Core download engine with streaming, progress tracking, and resume support.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -14,6 +15,7 @@ from typing import Optional
 import httpx
 
 from app.database import db
+from app.events import notifier
 from app.metrics import metrics
 from app.settings import settings
 from app.throttle import BandwidthThrottle, DownloadSlots, mbps_to_bytes_per_second
@@ -38,6 +40,9 @@ CHUNK_SIZE = 65536
 
 # How often paused downloads check whether they may continue
 PAUSE_POLL_INTERVAL = 0.5
+
+# Read size for hashing files on disk
+HASH_READ_SIZE = 1024 * 1024
 
 # Global state for active downloads
 _active_downloads: dict[str, dict] = {}
@@ -64,6 +69,7 @@ def get_slots() -> DownloadSlots:
 def apply_settings() -> None:
     """Apply changed runtime settings to running components."""
     get_slots().limit = max(1, settings.get("max_concurrent_downloads"))
+    notifier.notify()
 
 
 def normalize_download_path(path: str) -> str:
@@ -128,6 +134,7 @@ def _set_state(download_id: str, state: str, **fields) -> None:
             download["speed_mbps"] = None
             download["eta_seconds"] = None
         download.update(fields)
+        notifier.notify()
 
 
 def is_globally_paused() -> bool:
@@ -157,6 +164,7 @@ def pause_all(duration_seconds: Optional[float] = None, reason: Optional[str] = 
     _pause_until = time.time() + duration_seconds if duration_seconds else None
     suffix = f" for {round(duration_seconds / 60)} min" if duration_seconds else ""
     logger.info(f"All downloads paused{suffix}" + (f" ({reason})" if reason else ""))
+    notifier.notify()
 
 
 def resume_all(reason: Optional[str] = None) -> None:
@@ -165,6 +173,7 @@ def resume_all(reason: Optional[str] = None) -> None:
     _globally_paused = False
     _pause_until = None
     logger.info("All downloads resumed" + (f" ({reason})" if reason else ""))
+    notifier.notify()
 
 
 def pause_download(download_id: str) -> bool:
@@ -180,6 +189,7 @@ def pause_download(download_id: str) -> bool:
         return False
     download["paused"] = True
     logger.info(f"[{download_id}] Download paused")
+    notifier.notify()
     return True
 
 
@@ -195,6 +205,7 @@ def resume_download(download_id: str) -> bool:
         return False
     download["paused"] = False
     logger.info(f"[{download_id}] Download resumed")
+    notifier.notify()
     return True
 
 
@@ -210,6 +221,7 @@ def set_download_limit(download_id: str, limit_mbps: Optional[float]) -> bool:
         return False
     download["limit_mbps"] = limit_mbps if limit_mbps and limit_mbps > 0 else None
     logger.info(f"[{download_id}] Speed limit set to {download['limit_mbps'] or 'global'} Mbps")
+    notifier.notify()
     return True
 
 
@@ -253,6 +265,7 @@ async def resume_interrupted_download(download_id: str) -> bool:
         webhook_url_complete=row.get("webhook_url_complete"),
         webhook_url_error=row.get("webhook_url_error"),
         started_at=datetime.fromisoformat(row["started_at"]),
+        expected_sha256=row.get("expected_sha256"),
     )
     _active_downloads[download_id]["downloaded_bytes"] = row.get("downloaded_bytes") or 0
     _active_downloads[download_id]["total_bytes"] = row.get("total_bytes")
@@ -290,7 +303,8 @@ def _new_download_state(
     webhook_url_error: Optional[str],
     started_at: datetime,
     limit_mbps: Optional[float] = None,
-    paused: bool = False
+    paused: bool = False,
+    expected_sha256: Optional[str] = None
 ) -> dict:
     """Build the in-memory state of an active download."""
     return {
@@ -313,6 +327,10 @@ def _new_download_state(
         "limit_mbps": limit_mbps if limit_mbps and limit_mbps > 0 else None,
         "attempt": 0,
         "last_error": None,
+        # SHA256 computed while streaming; hashed_bytes must equal the file size
+        "expected_sha256": expected_sha256,
+        "hasher": None,
+        "hashed_bytes": 0,
         "cookie": cookie,
         "headers": headers,
         "method": method,
@@ -335,6 +353,7 @@ def cancel_download(download_id: str) -> bool:
     if download_id in _active_downloads:
         _active_downloads[download_id]["cancelled"] = True
         logger.info(f"[{download_id}] Download marked for cancellation")
+        notifier.notify()
         return True
     return False
 
@@ -350,7 +369,8 @@ async def start_download(
     webhook_url_complete: Optional[str] = None,
     webhook_url_error: Optional[str] = None,
     limit_mbps: Optional[float] = None,
-    paused: bool = False
+    paused: bool = False,
+    expected_sha256: Optional[str] = None
 ) -> str:
     """
     Start a new download in the background.
@@ -367,6 +387,7 @@ async def start_download(
         webhook_url_error: Webhook URL for errors
         limit_mbps: Optional speed limit for this download
         paused: Add the download in paused state
+        expected_sha256: Expected SHA256 of the downloaded file (verified after download)
 
     Returns:
         Download ID
@@ -395,6 +416,7 @@ async def start_download(
         started_at=datetime.utcnow(),
         limit_mbps=limit_mbps,
         paused=paused,
+        expected_sha256=expected_sha256,
     )
 
     # Add to database
@@ -408,7 +430,8 @@ async def start_download(
         method=method,
         post_data=json.dumps(post_data) if post_data else None,
         webhook_url_complete=webhook_url_complete,
-        webhook_url_error=webhook_url_error
+        webhook_url_error=webhook_url_error,
+        expected_sha256=expected_sha256
     )
 
     # Start download task
@@ -416,6 +439,7 @@ async def start_download(
     _download_tasks[download_id] = task
 
     logger.info(f"[{download_id}] Download started: {url} -> {normalized_path}/{safe_filename}")
+    notifier.notify()
     return download_id
 
 
@@ -532,8 +556,9 @@ async def _perform_download(download_id: str) -> Optional[str]:
             )
 
             if success:
-                await _handle_download_complete(download_id, filepath)
-                return "completed"
+                if await _handle_download_complete(download_id, filepath):
+                    return "completed"
+                return "failed"
 
         except DownloadPaused:
             logger.info(f"[{download_id}] Download paused at {format_bytes(os.path.getsize(filepath))}")
@@ -624,6 +649,14 @@ async def _stream_download(
     # Limits are re-read for every chunk so changes apply immediately.
     download_throttle = BandwidthThrottle()
 
+    # Bring the checksum up to date with the partial file before resuming
+    if start_byte > 0 and (download.get("hasher") is None or download["hashed_bytes"] != start_byte):
+        _set_state(download_id, "verifying")
+        download["hasher"], download["hashed_bytes"] = await asyncio.to_thread(
+            hash_file, filepath, start_byte
+        )
+        _set_state(download_id, "downloading")
+
     # Progress tracking
     downloaded_bytes = start_byte
     total_bytes = None
@@ -663,6 +696,10 @@ async def _stream_download(
 
             # Open file for writing (append if resuming)
             mode = "ab" if start_byte > 0 and response.status_code == 206 else "wb"
+            if mode == "wb":
+                download["hasher"] = hashlib.sha256()
+                download["hashed_bytes"] = 0
+            hasher = download["hasher"]
 
             with open(filepath, mode) as f:
                 async for chunk in response.aiter_bytes(chunk_size=CHUNK_SIZE):
@@ -677,6 +714,8 @@ async def _stream_download(
 
                     # Write chunk
                     f.write(chunk)
+                    hasher.update(chunk)
+                    download["hashed_bytes"] += len(chunk)
                     downloaded_bytes += len(chunk)
 
                     # Apply bandwidth limiting
@@ -752,21 +791,84 @@ def _download_rate_limit(download_id: str) -> float:
     return mbps_to_bytes_per_second(min(limits)) if limits else 0.0
 
 
-async def _handle_download_complete(download_id: str, filepath: str) -> None:
+def hash_file(filepath: str, limit: Optional[int] = None) -> tuple["hashlib._Hash", int]:
+    """
+    Compute SHA256 of a file (or of its first `limit` bytes).
+
+    Returns:
+        Tuple of (hash object, number of bytes hashed)
+    """
+    hasher = hashlib.sha256()
+    hashed = 0
+    with open(filepath, "rb") as f:
+        while limit is None or hashed < limit:
+            size = HASH_READ_SIZE if limit is None else min(HASH_READ_SIZE, limit - hashed)
+            data = f.read(size)
+            if not data:
+                break
+            hasher.update(data)
+            hashed += len(data)
+    return hasher, hashed
+
+
+async def _verify_checksum(download_id: str, filepath: str, size_bytes: int) -> Optional[str]:
+    """
+    Get the SHA256 of the downloaded file and compare it with the expected value.
+
+    Returns:
+        Error message on mismatch, None if OK
+    """
+    download = _active_downloads[download_id]
+    if download.get("hasher") is not None and download["hashed_bytes"] == size_bytes:
+        sha256 = download["hasher"].hexdigest()
+    else:
+        # Streaming hash is not in sync with the file (should not happen), hash it again
+        _set_state(download_id, "verifying")
+        hasher, _ = await asyncio.to_thread(hash_file, filepath)
+        sha256 = hasher.hexdigest()
+    download["sha256"] = sha256
+
+    expected = download.get("expected_sha256")
+    if not expected:
+        logger.info(f"[{download_id}] SHA256: {sha256}")
+        return None
+    if sha256 == expected:
+        logger.info(f"[{download_id}] SHA256 verified: {sha256}")
+        return None
+
+    # Keep the data but move it aside, so a new download does not resume from it
+    bad_path = filepath + ".sha256-mismatch"
+    os.replace(filepath, bad_path)
+    return (
+        f"SHA256 mismatch: expected {expected}, got {sha256}; "
+        f"file kept as {os.path.basename(bad_path)}"
+    )
+
+
+async def _handle_download_complete(download_id: str, filepath: str) -> bool:
     """
     Handle successful download completion.
 
     Args:
         download_id: Download identifier
         filepath: Path to downloaded file
+
+    Returns:
+        True if completed, False if the checksum verification failed
     """
     download = _active_downloads.get(download_id)
     if not download:
-        return
+        return False
 
     # Get final file size
     size_bytes = os.path.getsize(filepath)
     decompressed = False
+
+    # Verify integrity before any decompression
+    checksum_error = await _verify_checksum(download_id, filepath, size_bytes)
+    if checksum_error:
+        await _handle_download_failure(download_id, checksum_error)
+        return False
 
     # Auto decompress if enabled (in a thread so the API stays responsive)
     if settings.get("auto_decompress"):
@@ -786,7 +888,10 @@ async def _handle_download_complete(download_id: str, filepath: str) -> None:
     metrics.record_duration(duration)
 
     # Update database
-    data = await db.complete_download(download_id, size_bytes, decompressed)
+    data = await db.complete_download(
+        download_id, size_bytes, decompressed,
+        sha256=download.get("sha256"), expected_sha256=download.get("expected_sha256")
+    )
 
     logger.info(
         f"[{download_id}] Download completed: {filepath} "
@@ -804,12 +909,15 @@ async def _handle_download_complete(download_id: str, filepath: str) -> None:
             size_bytes=size_bytes,
             started_at=started_at,
             completed_at=completed_at,
-            decompressed=decompressed
+            decompressed=decompressed,
+            sha256=download.get("sha256")
         )
 
     # Cleanup
     if download_id in _active_downloads:
         del _active_downloads[download_id]
+    notifier.notify()
+    return True
 
 
 async def _handle_download_failure(download_id: str, error_message: str) -> None:
@@ -844,6 +952,7 @@ async def _handle_download_failure(download_id: str, error_message: str) -> None
     # Cleanup
     if download_id in _active_downloads:
         del _active_downloads[download_id]
+    notifier.notify()
 
 
 async def _handle_download_cancelled(download_id: str) -> None:
@@ -865,3 +974,4 @@ async def _handle_download_cancelled(download_id: str) -> None:
     # Cleanup
     if download_id in _active_downloads:
         del _active_downloads[download_id]
+    notifier.notify()

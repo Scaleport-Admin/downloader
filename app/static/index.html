@@ -145,7 +145,7 @@ input[type="checkbox"] { width: auto; }
 .badge.downloading, .badge.completed { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 50%, transparent); }
 .badge.queued { color: var(--info); border-color: color-mix(in srgb, var(--info) 50%, transparent); }
 .badge.paused, .badge.retrying, .badge.cancelled { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 50%, transparent); }
-.badge.processing { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 50%, transparent); }
+.badge.processing, .badge.verifying { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 50%, transparent); }
 .badge.failed { color: var(--err); border-color: color-mix(in srgb, var(--err) 50%, transparent); }
 .empty { color: var(--muted); text-align: center; padding: 20px 0; }
 .err-text { color: var(--err); font-size: 12px; margin-top: 4px; word-break: break-word; }
@@ -171,6 +171,12 @@ dl.kv dd { margin: 0; word-break: break-all; }
 .log .ERROR, .log .CRITICAL { color: var(--err); }
 .log .DEBUG { color: var(--muted); }
 .log time { color: var(--muted); margin-right: 8px; }
+.live-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); opacity: .6; }
+.live-dot.on { background: var(--ok); opacity: 1; box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent); }
+.ok-text { color: var(--ok); font-weight: 600; }
+.link-btn { background: none; border: 0; padding: 0; font: inherit; color: var(--accent); cursor: pointer; }
+.link-btn:hover { text-decoration: underline; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .pause-ctl { position: relative; display: inline-flex; align-items: stretch; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
 .pause-ctl > button { background: none; border: 0; color: var(--text); cursor: pointer; padding: 6px 10px; display: inline-flex; align-items: center; }
 .pause-ctl > button:hover { background: var(--surface-2); }
@@ -231,7 +237,7 @@ tr.disabled td { opacity: .55; }
 
 <header>
   <div class="header-inner">
-    <div class="brand">File Downloader <small id="version"></small></div>
+    <div class="brand">File Downloader <small id="version"></small> <span class="live-dot" id="live-dot" title="Načítám…"></span></div>
     <div class="pause-ctl" id="pause-ctl">
       <button type="button" id="pc-main" title="Pozastavit vše" aria-label="Pozastavit vše"></button>
       <button type="button" id="pc-menu-btn" title="Pozastavit na dobu" aria-haspopup="true" aria-expanded="false">
@@ -347,6 +353,11 @@ tr.disabled td { opacity: .55; }
           <label for="n-limit">Limit rychlosti (Mbps)</label>
           <input id="n-limit" type="number" min="0" step="any" placeholder="dle globálního nastavení">
         </div>
+      </div>
+      <div class="field">
+        <label for="n-sha">SHA256 (volitelné)</label>
+        <input id="n-sha" class="mono" spellcheck="false" autocomplete="off" placeholder="64 hexadecimálních znaků, např. z webu se staženým souborem">
+        <span class="hint">Po stažení se soubor ověří. Při neshodě se stahování označí jako selhané a soubor se přejmenuje na *.sha256-mismatch.</span>
       </div>
       <details>
         <summary style="cursor:pointer;margin-bottom:12px">Pokročilé (cookie, hlavičky, webhooky)</summary>
@@ -569,7 +580,7 @@ function toast(message, isError = false) {
 
 const STATE_LABELS = {
   downloading: "Stahuje se", queued: "Ve frontě", paused: "Pozastaveno",
-  retrying: "Opakování", processing: "Rozbaluje se",
+  retrying: "Opakování", processing: "Rozbaluje se", verifying: "Kontroluje se",
   completed: "Dokončeno", failed: "Selhalo", cancelled: "Zrušeno"
 };
 
@@ -651,6 +662,7 @@ $("#login-form").addEventListener("submit", async (event) => {
 $("#logout-btn").addEventListener("click", () => {
   apiKey = "";
   storageSet("downloader.apiKey", null);
+  disconnectLive();
   showLogin();
 });
 
@@ -733,6 +745,7 @@ function renderActive(d) {
         <span>Rychlost <b>${formatSpeed(d.speed_mbps)}</b></span>
         <span>Zbývá <b>${formatDuration(d.eta_seconds)}</b></span>
         <span>Zahájeno ${esc(formatDate(d.started_at))}</span>
+        ${d.expected_sha256 ? `<span title="${esc(d.expected_sha256)}">Ověří se SHA256</span>` : ""}
       </div>
       ${d.last_error && d.state === "retrying" ? `<div class="err-text">${esc(d.last_error)}</div>` : ""}
     </div>`;
@@ -783,7 +796,15 @@ function renderStatus(s) {
     ? `z ${formatBytes(s.disk.total_bytes)} (${Math.round(s.disk.used_bytes / s.disk.total_bytes * 100)} % využito)` : s.downloads_path;
   $("#t-done").textContent = s.totals.completed;
   $("#t-done-sub").textContent = `${formatBytes(s.totals.bytes_downloaded)}, ${s.totals.failed} selhalo, ${s.totals.cancelled} zrušeno`;
+  uptimeBase = { seconds: s.uptime_seconds, at: Date.now() };
   $("#t-uptime").textContent = formatDuration(s.uptime_seconds);
+  const totalsKey = JSON.stringify([s.totals, s.history_counts]);
+  if (lastTotalsKey !== null && totalsKey !== lastTotalsKey) {
+    // A download finished or history changed
+    refreshRecent();
+    if (currentTab === "history" && historyOffset === 0) loadHistory();
+  }
+  lastTotalsKey = totalsKey;
   $("#t-uptime-sub").textContent = `Verze ${s.version}`;
 
   if (!quickFormDirty) {
@@ -916,6 +937,7 @@ $("#new-form").addEventListener("submit", async (event) => {
       webhook_url_complete: $("#n-wh-ok").value.trim() || null,
       webhook_url_error: $("#n-wh-err").value.trim() || null,
       limit_mbps: $("#n-limit").value ? Number($("#n-limit").value) : null,
+      sha256: $("#n-sha").value.trim() || null,
       paused: $("#n-paused").checked,
     };
   } catch (e) {
@@ -925,7 +947,7 @@ $("#new-form").addEventListener("submit", async (event) => {
   try {
     await api("POST", "/api/downloads", body);
     toast(`Stahování ${body.filename} přidáno`);
-    ["#n-url", "#n-filename", "#n-cookie", "#n-headers", "#n-post", "#n-limit"].forEach((s) => { $(s).value = ""; });
+    ["#n-url", "#n-filename", "#n-cookie", "#n-headers", "#n-post", "#n-limit", "#n-sha"].forEach((s) => { $(s).value = ""; });
     $("#n-paused").checked = false;
     filenameTouched = false;
     showTab("overview");
@@ -950,6 +972,9 @@ function historyRow(h) {
         <div class="dl-name">${esc(h.filename)}${h.decompressed ? ' <span class="muted">(rozbaleno)</span>' : ""}</div>
         <div class="dl-url">${esc(h.url)}</div>
         <div class="dl-url">${esc(h.path)}</div>
+        ${h.sha256 ? `<div class="dl-url">SHA256 <span class="mono" title="${esc(h.sha256)}">${esc(h.sha256.slice(0, 16))}…</span>
+          ${h.checksum_verified ? '<span class="ok-text">✓ ověřeno</span>' : ""}
+          <button type="button" class="link-btn" data-copy="${esc(h.sha256)}">kopírovat</button></div>` : ""}
         ${h.error_message && h.status !== "cancelled" ? `<div class="err-text">${esc(h.error_message)}</div>` : ""}
       </td>
       <td class="num">${formatBytes(h.size_bytes)}</td>
@@ -1123,13 +1148,17 @@ function renderLogs() {
   if ($("#log-follow").checked) box.scrollTop = box.scrollHeight;
 }
 
+function appendLogs(records) {
+  if (!records.length) return;
+  logRecords = logRecords.concat(records.filter((r) => r.id > lastLogId)).slice(-500);
+  lastLogId = Math.max(lastLogId, records[records.length - 1].id);
+  if (currentTab === "logs") renderLogs();
+}
+
 async function loadLogs() {
   try {
     const data = await api("GET", `/api/logs?after=${lastLogId}`);
-    if (data.logs.length) {
-      logRecords = logRecords.concat(data.logs).slice(-500);
-      lastLogId = logRecords[logRecords.length - 1].id;
-    }
+    appendLogs(data.logs);
     renderLogs();
   } catch (e) { /* shown by status banner */ }
 }
@@ -1372,18 +1401,114 @@ $("#schedule-list").addEventListener("change", async (event) => {
 // Polling
 // ---------------------------------------------------------------------------
 
+// Live updates are pushed by the server (Server-Sent Events read with
+// fetch, so the API key travels in a header, not in the URL). While the
+// stream is not connected the page falls back to polling every 2 s.
+
+let liveController = null;
+let liveConnected = false;
+let lastTotalsKey = null;
+let uptimeBase = null;
+
+function setLive(on) {
+  liveConnected = on;
+  $("#live-dot").classList.toggle("on", on);
+  $("#live-dot").title = on ? "Živé aktualizace" : "Obnovuje se každé 2 s (živé spojení není k dispozici)";
+}
+
+function handleLiveEvent(block) {
+  let event = "message";
+  const data = [];
+  for (const line of block.split("\n")) {
+    if (line.startsWith("event:")) event = line.slice(6).trim();
+    else if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
+  }
+  if (!data.length) return;
+  const payload = JSON.parse(data.join("\n"));
+  if (event === "status") {
+    renderStatus(payload);
+    $("#conn-banner").classList.add("hidden");
+  } else if (event === "logs") {
+    appendLogs(payload);
+  }
+}
+
+async function connectLive() {
+  if (liveController || !$("#login").classList.contains("hidden")) return;
+  const controller = new AbortController();
+  liveController = controller;
+  let retry = true;
+  try {
+    const headers = apiKey ? { "X-API-Key": apiKey } : {};
+    const response = await fetch(`/api/events?log_after=${lastLogId}`, {
+      headers, signal: controller.signal, cache: "no-store"
+    });
+    if (response.status === 401) {
+      retry = false;
+      showLogin(await response.text());
+      return;
+    }
+    if (!response.ok || !response.body) return;
+    setLive(true);
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+      let index;
+      while ((index = buffer.indexOf("\n\n")) >= 0) {
+        const block = buffer.slice(0, index);
+        buffer = buffer.slice(index + 2);
+        try { handleLiveEvent(block); } catch (e) { console.warn("Bad live event", e); }
+      }
+    }
+  } catch (e) {
+    /* network error or aborted */
+  } finally {
+    if (liveController === controller) liveController = null;
+    setLive(false);
+    if (retry && !controller.signal.aborted) setTimeout(connectLive, 3000);
+  }
+}
+
+function disconnectLive() {
+  if (liveController) liveController.abort();
+  liveController = null;
+  setLive(false);
+}
+
 let tick = 0;
 setInterval(() => {
   if (document.hidden) return;
   tick++;
-  refreshStatus();
-  if (currentTab === "overview" && tick % 5 === 0) refreshRecent();
+  if (!liveConnected) {
+    refreshStatus();
+    if (currentTab === "overview" && tick % 5 === 0) refreshRecent();
+    if (currentTab === "logs" && tick % 2 === 0) loadLogs();
+  }
   if (currentTab === "schedule" && tick % 15 === 0) loadSchedules();
-  if (currentTab === "logs" && tick % 2 === 0) loadLogs();
 }, 2000);
 
+setInterval(() => {
+  if (uptimeBase) $("#t-uptime").textContent = formatDuration(uptimeBase.seconds + (Date.now() - uptimeBase.at) / 1000);
+}, 1000);
+
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) { refreshStatus(); refreshRecent(); }
+  if (!document.hidden && !liveConnected) { refreshStatus(); refreshRecent(); }
+});
+
+document.addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-copy]");
+  if (!button) return;
+  try {
+    await navigator.clipboard.writeText(button.dataset.copy);
+    toast("Zkopírováno");
+  } catch (e) {
+    // Clipboard API needs HTTPS; show the value for manual copying
+    prompt("SHA256:", button.dataset.copy);
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -1395,6 +1520,7 @@ function startApp() {
   showTab(["overview", "new", "history", "schedule", "settings", "logs"].includes(savedTab) ? savedTab : "overview");
   refreshStatus();
   refreshRecent();
+  connectLive();
 }
 
 (async function init() {

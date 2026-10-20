@@ -7,6 +7,8 @@ its behaviour unchanged) and has its own, more generous rate limit so the
 UI can poll for progress.
 """
 
+import asyncio
+import json
 import logging
 import os
 import re
@@ -17,12 +19,13 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from app import __version__
 from app.auth import is_insecure_mode, validate_api_key
 from app.database import db
+from app.events import notifier
 from app.downloader import (
     DOWNLOADS_BASE_PATH,
     cancel_download,
@@ -159,6 +162,7 @@ def _download_view(d: dict) -> dict:
         "queue_position": get_queue_position(d["download_id"]) if state == "queued" else 0,
         "method": d.get("method", "GET"),
         "has_cookie": bool(d.get("cookie")),
+        "expected_sha256": d.get("expected_sha256"),
     }
 
 
@@ -191,6 +195,8 @@ def _history_view(row: dict) -> dict:
         "duration_seconds": row.get("duration_seconds"),
         "error_message": row.get("error_message"),
         "decompressed": bool(row.get("decompressed")),
+        "sha256": row.get("sha256"),
+        "checksum_verified": bool(row.get("expected_sha256")) and row.get("expected_sha256") == row.get("sha256"),
     }
 
 
@@ -234,7 +240,70 @@ async def web_ui():
 async def get_status(request: Request):
     """Everything the dashboard needs in a single request."""
     _authorize(request)
+    return await _status_payload()
 
+
+EVENT_INTERVAL_SECONDS = 1.0
+EVENT_KEEPALIVE_SECONDS = 15.0
+
+
+def _sse(event: str, data: Any) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, separators=(',', ':'))}\n\n"
+
+
+async def event_stream(log_after: int = 0):
+    """
+    Server-Sent Events stream for the web UI.
+
+    Sends the dashboard status whenever it changes (at most a few times per
+    second, at least every second while something changes) and new log
+    records. A comment line is sent periodically to keep proxies from
+    closing an idle connection.
+    """
+    yield "retry: 3000\n\n"
+    last_status = None
+    last_sent = time.monotonic()
+    while True:
+        seen_version = notifier.version
+        status_data = await _status_payload()
+        # Uptime changes every second; it does not count as a change on its own
+        comparable = json.dumps({**status_data, "uptime_seconds": None}, sort_keys=True)
+        if comparable != last_status:
+            last_status = comparable
+            last_sent = time.monotonic()
+            yield _sse("status", status_data)
+
+        logs = memory_log_handler.get_records(after_id=log_after)
+        if logs:
+            log_after = logs[-1]["id"]
+            last_sent = time.monotonic()
+            yield _sse("logs", logs)
+
+        if time.monotonic() - last_sent >= EVENT_KEEPALIVE_SECONDS:
+            last_sent = time.monotonic()
+            yield ": keepalive\n\n"
+
+        if await notifier.wait(seen_version, timeout=EVENT_INTERVAL_SECONDS):
+            # Coalesce bursts of changes into one message
+            await asyncio.sleep(0.1)
+
+
+@api_router.get("/events")
+async def events(
+    request: Request,
+    log_after: int = Query(0, ge=0, description="Send log records with id greater than this")
+):
+    """Live updates for the web UI (text/event-stream)."""
+    _authorize(request)
+    return StreamingResponse(
+        event_stream(log_after),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+async def _status_payload() -> dict:
+    """Dashboard data."""
     active = [_download_view(d) for d in get_active_downloads().values()]
     active.sort(key=lambda d: d["started_at"] or "")
     interrupted = [_interrupted_view(row) for row in await get_interrupted_downloads()]
@@ -284,6 +353,7 @@ async def create_download(request: Request, body: NewDownloadRequest):
         post_data=body.post_data,
         webhook_url_complete=body.webhook_url_complete,
         webhook_url_error=body.webhook_url_error,
+        expected_sha256=body.sha256,
         limit_mbps=body.limit_mbps,
         paused=body.paused,
     )

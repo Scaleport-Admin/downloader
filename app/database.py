@@ -145,6 +145,11 @@ class Database:
                 )
             """)
 
+            # Columns added in later versions (older versions ignore them)
+            await self._ensure_column("active_downloads", "expected_sha256", "TEXT")
+            await self._ensure_column("download_history", "sha256", "TEXT")
+            await self._ensure_column("download_history", "expected_sha256", "TEXT")
+
             # Initialize metrics if not exists
             for key in ["downloads_completed", "downloads_failed", "downloads_cancelled", "bytes_downloaded"]:
                 await self._connection.execute(
@@ -154,6 +159,14 @@ class Database:
 
             await self._connection.commit()
             logger.info("Database tables created/verified")
+
+    async def _ensure_column(self, table: str, column: str, column_type: str) -> None:
+        """Add a column to an existing table if it is missing (caller holds the lock)."""
+        cursor = await self._connection.execute(f"PRAGMA table_info({table})")
+        columns = {row["name"] for row in await cursor.fetchall()}
+        if column not in columns:
+            await self._connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+            logger.info(f"Database migrated: added {table}.{column}")
 
     async def add_download(
         self,
@@ -166,7 +179,8 @@ class Database:
         method: str = "GET",
         post_data: Optional[str] = None,
         webhook_url_complete: Optional[str] = None,
-        webhook_url_error: Optional[str] = None
+        webhook_url_error: Optional[str] = None,
+        expected_sha256: Optional[str] = None
     ) -> None:
         """
         Add a new download to active downloads.
@@ -182,6 +196,7 @@ class Database:
             post_data: Optional JSON POST data string
             webhook_url_complete: Webhook URL for completion
             webhook_url_error: Webhook URL for errors
+            expected_sha256: Expected SHA256 of the file
         """
         now = datetime.utcnow().isoformat()
         async with self._lock:
@@ -189,11 +204,13 @@ class Database:
                 """
                 INSERT INTO active_downloads
                 (download_id, url, filename, path, status, started_at, updated_at,
-                 cookie, headers, method, post_data, webhook_url_complete, webhook_url_error)
-                VALUES (?, ?, ?, ?, 'downloading', ?, ?, ?, ?, ?, ?, ?, ?)
+                 cookie, headers, method, post_data, webhook_url_complete, webhook_url_error,
+                 expected_sha256)
+                VALUES (?, ?, ?, ?, 'downloading', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (download_id, url, filename, path, now, now,
-                 cookie, headers, method, post_data, webhook_url_complete, webhook_url_error)
+                 cookie, headers, method, post_data, webhook_url_complete, webhook_url_error,
+                 expected_sha256)
             )
             await self._connection.commit()
         logger.info(f"[{download_id}] Download added to database")
@@ -233,7 +250,9 @@ class Database:
         self,
         download_id: str,
         size_bytes: int,
-        decompressed: bool = False
+        decompressed: bool = False,
+        sha256: Optional[str] = None,
+        expected_sha256: Optional[str] = None
     ) -> dict:
         """
         Mark download as completed and move to history.
@@ -242,6 +261,8 @@ class Database:
             download_id: Download identifier
             size_bytes: Final file size
             decompressed: Whether file was decompressed
+            sha256: SHA256 of the downloaded file
+            expected_sha256: Expected SHA256 (verified) if one was given
 
         Returns:
             Download data dictionary
@@ -267,11 +288,13 @@ class Database:
                 """
                 INSERT INTO download_history
                 (download_id, url, filename, path, status, size_bytes,
-                 started_at, completed_at, duration_seconds, decompressed)
-                VALUES (?, ?, ?, ?, 'completed', ?, ?, ?, ?, ?)
+                 started_at, completed_at, duration_seconds, decompressed,
+                 sha256, expected_sha256)
+                VALUES (?, ?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (download_id, data["url"], data["filename"], data["path"],
-                 size_bytes, data["started_at"], now, duration_seconds, decompressed)
+                 size_bytes, data["started_at"], now, duration_seconds, decompressed,
+                 sha256, expected_sha256)
             )
 
             # Remove from active

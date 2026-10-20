@@ -8,7 +8,7 @@
 # The image is built straight from GitHub (default branch) on every deploy,
 # so no local checkout is needed and an old cached image is never reused.
 # The first deploy takes a few minutes. To pin a branch or tag, append it to
-# the URL, e.g. ...downloader.git#v1.1.0
+# the URL, e.g. ...downloader.git#<branch-or-commit>
 
 services:
   file-downloader:

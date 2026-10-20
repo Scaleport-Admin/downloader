@@ -19,6 +19,8 @@ A production-ready Docker container with FastAPI service for downloading large f
 - **Web UI**: Dashboard for monitoring and managing downloads and settings (`/ui`)
 - **Pause / Resume**: Pause single downloads or everything (also for 5 min ... 6 h or a custom time, like SABnzbd); paused downloads continue where they stopped
 - **Scheduler**: Change the speed limit or pause/resume all downloads at set times on selected days
+- **Integrity Check**: SHA256 of every download is computed while streaming and optionally verified against an expected value
+- **Live Updates**: The web UI receives changes instantly via Server-Sent Events (falls back to polling)
 - **Runtime Settings**: Change speed limits, concurrency, retries etc. without restart
 - **Restart Recovery**: Downloads interrupted by a restart can be resumed from the web UI
 
@@ -54,6 +56,25 @@ As in SABnzbd, a manual change stays in effect until the next scheduled action,
 and at startup the most recent past action of each kind is applied. Example:
 weekdays 08:00 limit 50 Mbps, every day 22:00 limit 0 (unlimited).
 
+### Integrity check (SHA256)
+
+The SHA256 of every download is computed while it is being downloaded (no
+second pass over the file, works across pause, retry and restart) and shown in
+the history. If `sha256` is given when starting a download (optional, also in
+`POST /download`; a `sha256:` prefix and upper case are accepted), the file is
+verified before decompression. On a mismatch the download is marked as failed
+and the file is renamed to `<name>.sha256-mismatch` (kept, not deleted). The
+completion webhook contains the `sha256` field.
+
+### Live updates
+
+The web UI keeps one connection to `GET /api/events` (Server-Sent Events,
+authenticated with the `X-API-Key` header) and receives status changes and
+log records as they happen. The green dot next to the version shows a live
+connection; without it (e.g. a proxy that buffers responses) the UI polls
+every 2 seconds and reconnects automatically. Behind nginx the endpoint sends
+`X-Accel-Buffering: no`.
+
 Downloads interrupted by a container restart are listed on the overview and can be
 resumed (continuing from the partial file) or discarded.
 
@@ -81,7 +102,8 @@ unchanged.
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/status` | Dashboard data (active, queued, interrupted downloads, disk, totals) |
-| POST | `/api/downloads` | Start a download (same fields as `POST /download` without `api_key`, plus `limit_mbps`, `paused`) |
+| GET | `/api/events` | Live updates (Server-Sent Events): `status` and `logs` events |
+| POST | `/api/downloads` | Start a download (same fields as `POST /download` without `api_key`, plus `limit_mbps`, `paused`); `sha256` verifies the file |
 | POST | `/api/downloads/{id}/pause` | Pause a download |
 | POST | `/api/downloads/{id}/resume` | Resume a download |
 | PATCH | `/api/downloads/{id}` | Set per-download speed limit `{"limit_mbps": 50}` |
@@ -155,7 +177,8 @@ curl -X POST http://localhost:8000/download \
       "User-Agent": "Mozilla/5.0"
     },
     "webhook_url_complete": "https://webhook.site/xxx",
-    "webhook_url_error": "https://webhook.site/xxx"
+    "webhook_url_error": "https://webhook.site/xxx",
+    "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
   }'
 ```
 
@@ -384,7 +407,7 @@ For a TrueNAS "Custom App" (Install via YAML) use `docker-compose.truenas.yml`:
 it builds the image directly from GitHub on every deploy (`pull_policy: build`),
 so no local checkout is needed and an outdated cached `file-downloader:latest`
 image is never reused. The first line of the container log shows the running
-version (`Starting File Downloader Service v1.1.0...`).
+version (`Starting File Downloader Service v1.2.0...`).
 
 Otherwise edit the volume paths in `docker-compose.yml`:
 
@@ -428,7 +451,8 @@ curl http://your-truenas-ip:8000/health
   "started_at": "2025-01-15T10:30:00Z",
   "completed_at": "2025-01-15T10:35:23Z",
   "duration_seconds": 323,
-  "decompressed": true
+  "decompressed": true,
+  "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
 }
 ```
 
@@ -472,8 +496,9 @@ git checkout 3cf8f67        # or: git checkout v1.0.0
 docker-compose build && docker-compose up -d
 ```
 
-The database stays compatible in both directions: version 1.1.0 only adds the
-`settings` and `schedules` tables, which version 1.0.0 ignores.
+The database stays compatible in both directions: newer versions only add tables
+(`settings`, `schedules`) and columns (`sha256`, `expected_sha256`), which
+version 1.0.0 ignores.
 
 ## Project Structure
 
@@ -492,6 +517,7 @@ file-downloader/
 │   ├── settings.py           # Runtime settings (changeable from web UI)
 │   ├── runtime.py            # Loading / saving / applying runtime settings
 │   ├── scheduler.py          # Scheduled speed limit / pause / resume
+│   ├── events.py             # Change notifications for live updates (SSE)
 │   ├── throttle.py           # Bandwidth throttling and download queue
 │   ├── web.py                # Web UI and management API (/ui, /api)
 │   ├── static/index.html     # Web UI (single page, no external dependencies)

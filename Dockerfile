@@ -66,7 +66,7 @@ if [ "$RUN_AS_ROOT" = "true" ] || [ "$RUN_AS_ROOT" = "1" ]; then\n\
     echo "Running as root (for NFS/network shares)..."\n\
     chown -R root:root /data 2>/dev/null || true\n\
     echo "Starting application on port $PORT..."\n\
-    exec uvicorn app.main:app --host 0.0.0.0 --port $PORT\n\
+    exec uvicorn app.main:app --host 0.0.0.0 --port $PORT --timeout-graceful-shutdown 5\n\
 fi\n\
 if [ "$PUID" != "1000" ] || [ "$PGID" != "1000" ]; then\n\
     groupmod -g "$PGID" appgroup 2>/dev/null || true\n\
@@ -88,7 +88,7 @@ if ! gosu appuser touch /downloads/.write_test 2>/dev/null; then\n\
 fi\n\
 rm -f /downloads/.write_test 2>/dev/null || true\n\
 echo "Starting application on port $PORT..."\n\
-exec gosu appuser uvicorn app.main:app --host 0.0.0.0 --port $PORT\n\
+exec gosu appuser uvicorn app.main:app --host 0.0.0.0 --port $PORT --timeout-graceful-shutdown 5\n\
 ' > /entrypoint.sh && chmod +x /entrypoint.sh
 
 # Default environment variables
